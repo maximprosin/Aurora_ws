@@ -1,0 +1,80 @@
+# ROS 2 workspace build directories
+build/
+install/
+log/
+
+# Qt Creator / IDE files
+.qtc_clangd
+*.workspace
+*.user
+*.user.*
+*.creator*
+*.files
+*.includes
+*.config
+*.autosave
+*.sublime-*
+.vscode/
+.idea/
+
+# Compiled files
+*.pyc
+*.pyo
+__pycache__/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.o
+*.a
+
+# Backup files
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.cache
+
+# CMake build directories (if you build inside src)
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+build_isolated/
+devel_isolated/
+
+# Gazebo / simulation files
+*.gazebo
+*.world~
+*.sdf~
+*.dae~
+
+# Doxygen documentation
+html/
+latex/
+docs/
+
+# Coverage reports
+*.gcda
+*.gcno
+*.gcov
+coverage/
