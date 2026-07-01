@@ -13,6 +13,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(mavros_msgs REQUIRED)
 
 # uncomment the following section in order to fill in
 # further dependencies manually.
@@ -35,7 +36,8 @@ rclcpp
 sensor_msgs
 cv_bridge
 OpenCV
-geometry_msgs)
+geometry_msgs
+mavros_msgs )
 install(TARGETS ${PROJECT_NAME}_node
 DESTINATION lib/${PROJECT_NAME})
 ament_package()
