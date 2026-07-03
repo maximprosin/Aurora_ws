@@ -1,5 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp>   // Для состояния камеры
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -8,14 +8,12 @@
 #include <thread>
 #include <array>
 #include <string>
+#include <sstream>
+#include <iomanip>
 
 namespace io = boost::asio;
 using io::ip::udp;
 
-/**
- * @brief UDP-клиент для приёма H.265 видео и отображения через OpenCV.
- *        Дополнительно подписывается на /gimbal/angles для отображения состояния камеры.
- */
 class UdpClientNode : public rclcpp::Node
 {
 public:
@@ -26,12 +24,14 @@ public:
         appsink_(nullptr),
         frame_count_(0),
         last_log_time_(this->now()),
-        current_mode_(0),
-        current_zoom_(0.0f)
+        current_pitch_(0.0f),
+        current_yaw_(0.0f),
+        current_mode_(-1),      // -1 означает "неизвестно"
+        current_zoom_(0.0f),
+        has_mode_zoom_(false)
     {
         RCLCPP_INFO(this->get_logger(), "=== UDP H.265 CLIENT ===");
 
-        // --- 1. Параметры ---
         this->declare_parameter<int>("udp_port", 12346);
         int udp_port = this->get_parameter("udp_port").as_int();
         if (udp_port < 1 || udp_port > 65535) {
@@ -40,7 +40,6 @@ public:
         }
         RCLCPP_INFO(this->get_logger(), "Listening on port: %d", udp_port);
 
-        // --- 2. Открытие UDP-сокета ---
         try {
             socket_.open(udp::v4());
             socket_.bind(udp::endpoint(udp::v4(), udp_port));
@@ -49,19 +48,14 @@ public:
             throw;
         }
 
-        // --- 3. Создание окна OpenCV ---
         cv::namedWindow("UDP Video", cv::WINDOW_NORMAL);
         cv::resizeWindow("UDP Video", 640, 480);
 
-        // --- 4. Инициализация GStreamer ---
         gst_init(nullptr, nullptr);
 
-        // --- 5. Сборка пайплайна декодирования ---
         std::string pipeline_str =
             "appsrc name=src format=time is-live=true block=false ! "
-            "h265parse ! "
-            "avdec_h265 ! "
-            "videoconvert ! "
+            "h265parse ! avdec_h265 ! videoconvert ! "
             "video/x-raw,format=BGR ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false";
 
@@ -74,7 +68,6 @@ public:
             throw std::runtime_error("GStreamer pipeline creation failed");
         }
 
-        // --- 6. Получение appsrc ---
         GstElement* src_elem = gst_bin_get_by_name(GST_BIN(pipeline_), "src");
         if (!src_elem) {
             RCLCPP_ERROR(this->get_logger(), "Failed to get 'src' element");
@@ -85,7 +78,6 @@ public:
         appsrc_ = GST_APP_SRC(src_elem);
         gst_object_unref(src_elem);
 
-        // --- 7. Настройка appsrc ---
         GstCaps* caps = gst_caps_new_simple("video/x-h265",
                                             "stream-format", G_TYPE_STRING, "byte-stream",
                                             nullptr);
@@ -94,7 +86,6 @@ public:
         gst_app_src_set_size(appsrc_, -1);
         gst_app_src_set_stream_type(appsrc_, GST_APP_STREAM_TYPE_STREAM);
 
-        // --- 8. Получение appsink ---
         GstElement* sink_elem = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
         if (!sink_elem) {
             RCLCPP_ERROR(this->get_logger(), "Failed to get 'sink' element");
@@ -105,16 +96,13 @@ public:
         appsink_ = GST_APP_SINK(sink_elem);
         gst_object_unref(sink_elem);
 
-        // --- 9. Настройка appsink ---
         gst_app_sink_set_emit_signals(appsink_, true);
         gst_app_sink_set_max_buffers(appsink_, 1);
         gst_app_sink_set_drop(appsink_, true);
 
-        // --- 10. Подключение колбэка на новый кадр ---
         g_signal_connect(appsink_, "new-sample",
                          G_CALLBACK(UdpClientNode::on_new_sample_static), this);
 
-        // --- 11. Запуск пайплайна ---
         GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
         if (ret == GST_STATE_CHANGE_FAILURE) {
             RCLCPP_ERROR(this->get_logger(), "Failed to set pipeline to PLAYING");
@@ -123,15 +111,12 @@ public:
             throw std::runtime_error("GStreamer start failed");
         }
 
-        // --- 12. Подписка на топик состояния камеры ---
         state_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
-            "/gimbal/angles", 10,
+            "/tcp_received/angles", 10,
             std::bind(&UdpClientNode::state_callback, this, std::placeholders::_1));
 
-        // --- 13. Запуск приёма UDP ---
         start_receive();
 
-        // --- 14. Запуск потока io_context ---
         io_thread_ = std::thread([this]() { io_context_.run(); });
 
         RCLCPP_INFO(this->get_logger(), "UDP Client ready! Subscribed to /gimbal/angles");
@@ -140,9 +125,7 @@ public:
     ~UdpClientNode()
     {
         io_context_.stop();
-        if (io_thread_.joinable()) {
-            io_thread_.join();
-        }
+        if (io_thread_.joinable()) io_thread_.join();
 
         if (socket_.is_open()) {
             boost::system::error_code ec;
@@ -159,7 +142,6 @@ public:
     }
 
 private:
-    // --- Члены класса ---
     io::io_context io_context_;
     udp::socket socket_;
     udp::endpoint remote_endpoint_;
@@ -173,12 +155,13 @@ private:
     unsigned int frame_count_;
     rclcpp::Time last_log_time_;
 
-    // --- Для состояния камеры ---
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr state_sub_;
-    int current_mode_;
+    float current_pitch_;
+    float current_yaw_;
+    int current_mode_;          // -1 = неизвестно
     float current_zoom_;
+    bool has_mode_zoom_;        // true если получены mode и zoom
 
-    // --- Запуск асинхронного приёма ---
     void start_receive()
     {
         socket_.async_receive_from(
@@ -186,7 +169,6 @@ private:
             remote_endpoint_,
             [this](const boost::system::error_code& error, size_t bytes_transferred) {
                 if (!error && bytes_transferred > 0) {
-                    // Передаём данные в appsrc
                     GstBuffer* buffer = gst_buffer_new_and_alloc(bytes_transferred);
                     GstMapInfo map;
                     gst_buffer_map(buffer, &map, GST_MAP_WRITE);
@@ -211,37 +193,39 @@ private:
                     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1.0,
                                           "UDP receive error: %s", error.message().c_str());
                 }
-                // Продолжаем приём
                 start_receive();
             }
             );
     }
 
-    // --- Колбэк для получения состояния камеры ---
+    // --- Исправленный колбэк для состояния камеры ---
     void state_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
     {
+        if (msg->data.size() >= 2) {
+            current_pitch_ = msg->data[0];
+            current_yaw_ = msg->data[1];
+        }
         if (msg->data.size() >= 4) {
-            // msg->data[0] = pitch, [1] = yaw, [2] = mode, [3] = zoom
             current_mode_ = static_cast<int>(msg->data[2]);
             current_zoom_ = msg->data[3];
-            RCLCPP_DEBUG(this->get_logger(), "State update: mode=%d, zoom=%.2f", current_mode_, current_zoom_);
+            has_mode_zoom_ = true;
+        } else {
+            has_mode_zoom_ = false;
         }
+        RCLCPP_DEBUG(this->get_logger(), "State update: pitch=%.1f, yaw=%.1f, mode=%d, zoom=%.2f, has_mode_zoom=%d",
+                     current_pitch_, current_yaw_, current_mode_, current_zoom_, has_mode_zoom_);
     }
 
-    // --- Статический колбэк для GStreamer (новый кадр) ---
     static GstFlowReturn on_new_sample_static(GstAppSink* sink, gpointer user_data)
     {
         UdpClientNode* node = static_cast<UdpClientNode*>(user_data);
         return node->process_gst_sample(sink);
     }
 
-    // --- Обработка декодированного кадра с наложением состояния ---
     GstFlowReturn process_gst_sample(GstAppSink* sink)
     {
         GstSample* sample = gst_app_sink_pull_sample(sink);
-        if (!sample) {
-            return GST_FLOW_ERROR;
-        }
+        if (!sample) return GST_FLOW_ERROR;
 
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         if (!buffer) {
@@ -255,36 +239,131 @@ private:
             return GST_FLOW_ERROR;
         }
 
-        // --- Определение размера изображения из caps ---
         GstCaps* caps = gst_sample_get_caps(sample);
         GstStructure* structure = gst_caps_get_structure(caps, 0);
         int width, height;
         gst_structure_get_int(structure, "width", &width);
         gst_structure_get_int(structure, "height", &height);
 
-        // --- Создание OpenCV Mat ---
         cv::Mat image(height, width, CV_8UC3, map.data);
 
-        // --- Наложение информации о состоянии ---
         if (!image.empty()) {
-            // Текст режима
+            // --- Формирование строк состояния ---
             std::string mode_str;
-            switch (current_mode_) {
-            case 0: mode_str = "RGB"; break;
-            case 1: mode_str = "Thermal"; break;
-            case 2: mode_str = "Wide"; break;
-            default: mode_str = "Unknown";
+            if (has_mode_zoom_) {
+                switch (current_mode_) {
+                case 0: mode_str = "RGB"; break;
+                case 1: mode_str = "Thermal"; break;
+                case 2: mode_str = "Wide"; break;
+                default: mode_str = "Unknown";
+                }
+            } else {
+                mode_str = "N/A";
             }
-            std::string info_text = "Mode: " + mode_str + "  Zoom: " + std::to_string(current_zoom_);
 
-            // Параметры текста
-            cv::putText(image, info_text, cv::Point(10, 30),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-            // Можно добавить и углы, если нужно
-            // float pitch = ...; float yaw = ...; (но они не сохраняются в текущей реализации)
+            std::string zoom_str;
+            if (has_mode_zoom_) {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2) << current_zoom_;
+                zoom_str = ss.str();
+            } else {
+                zoom_str = "N/A";
+            }
+
+            // Pitch
+            std::ostringstream pitch_ss;
+            pitch_ss << std::fixed << std::setprecision(1) << current_pitch_ << "deg";
+            std::string pitch_str = pitch_ss.str();
+
+            std::ostringstream yaw_ss;
+            yaw_ss << std::fixed << std::setprecision(1) << current_yaw_ << "deg";
+            std::string yaw_str = yaw_ss.str();
+
+            // --- Отрисовка ---
+            int start_x = 15;
+            int start_y = 45;
+            int line_height = 45;
+            double font_size = 1.0;
+            int thickness = 2;
+
+            // --- Крестовидный прицел ---
+            int center_x = width / 2;
+            int center_y = height / 2;
+            int cross_size = 30;        // длина каждой линии от центра
+            int square_size = 10;       // половина стороны квадрата
+            cv::Scalar cross_color(0, 255, 0); // ярко-зелёный
+
+            // Квадрат в центре
+            cv::rectangle(image,
+                          cv::Point(center_x - square_size, center_y - square_size),
+                          cv::Point(center_x + square_size, center_y + square_size),
+                          cross_color, 2);
+
+            // Вертикальные линии (вверх и вниз)
+            cv::line(image, cv::Point(center_x, center_y - cross_size),
+                     cv::Point(center_x, center_y - square_size), cross_color, 2);
+            cv::line(image, cv::Point(center_x, center_y + square_size),
+                     cv::Point(center_x, center_y + cross_size), cross_color, 2);
+
+            // Горизонтальные линии (влево и вправо)
+            cv::line(image, cv::Point(center_x - cross_size, center_y),
+                     cv::Point(center_x - square_size, center_y), cross_color, 2);
+            cv::line(image, cv::Point(center_x + square_size, center_y),
+                     cv::Point(center_x + cross_size, center_y), cross_color, 2);
+
+            // Фон
+            cv::rectangle(image,
+                          cv::Point(start_x - 10, start_y - 35),
+                          cv::Point(start_x + 290, start_y + 4 * line_height + 25),
+                          cv::Scalar(0, 0, 0),
+                          cv::FILLED);
+            cv::rectangle(image,
+                          cv::Point(start_x - 10, start_y - 35),
+                          cv::Point(start_x + 290, start_y + 4 * line_height + 25),
+                          cv::Scalar(180, 180, 180),
+                          2);
+
+            // Заголовок
+            cv::putText(image, "CAMERA STATE",
+                        cv::Point(start_x, start_y),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        cv::Scalar(255, 255, 255),
+                        2);
+
+            // Pitch
+            cv::putText(image, "Pitch:  " + pitch_str,
+                        cv::Point(start_x, start_y + line_height),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        font_size,
+                        cv::Scalar(255, 200, 0),
+                        thickness);
+
+            // Yaw
+            cv::putText(image, "Yaw:    " + yaw_str,
+                        cv::Point(start_x, start_y + 2 * line_height),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        font_size,
+                        cv::Scalar(0, 255, 0),
+                        thickness);
+
+            // Mode
+            cv::putText(image, "Mode:   " + mode_str,
+                        cv::Point(start_x, start_y + 3 * line_height),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        font_size,
+                        cv::Scalar(0, 200, 255),
+                        thickness);
+
+            // Zoom
+            cv::putText(image, "Zoom:   " + zoom_str,
+                        cv::Point(start_x, start_y + 4 * line_height),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        font_size,
+                        cv::Scalar(255, 0, 255),
+                        thickness);
         }
 
-        // --- Отображение ---
         cv::imshow("UDP Video", image);
         cv::waitKey(1);
 
