@@ -2,87 +2,115 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include <string>
 
-class VideoCamera : public rclcpp::Node {
+/**
+ * @brief Узел захвата видео с IP-камеры через RTSP.
+ * Публикует сжатые кадры H.265 в топик /camera_image.
+ */
+class VideoCamera : public rclcpp::Node
+{
 public:
-    VideoCamera() :
-        Node("video_camera_node"),
-        publisher_(nullptr),
-        gst_pipeline_(nullptr),
-        gst_appsink_(nullptr),
+    VideoCamera() : Node("video_camera_node"),
+        pipeline_(nullptr),
+        appsink_(nullptr),
         frame_count_(0),
         last_log_time_(this->now())
     {
         RCLCPP_INFO(this->get_logger(), "=== VideoCamera Node Started ===");
 
+        // --- 1. Параметры ---
+        this->declare_parameter<std::string>("rtsp_url", "rtsp://192.168.144.25:8554/video2");
+        std::string rtsp_url = this->get_parameter("rtsp_url").as_string();
+        RCLCPP_INFO(this->get_logger(), "RTSP URL: %s", rtsp_url.c_str());
+
+        // --- 2. Издатель ---
         rclcpp::QoS qos(rclcpp::KeepLast(1));
         qos.best_effort();
         qos.durability_volatile();
+        publisher_ = this->create_publisher<sensor_msgs::msg::Image>("/camera_image", qos);
 
-        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(
-            "/camera_image", qos);
-
+        // --- 3. Инициализация GStreamer ---
         gst_init(nullptr, nullptr);
 
-        // ★ ИСПРАВЛЕНИЕ: добавляем capsfilter для byte-stream ★
+        // --- 4. Пайплайн ---
         std::string pipeline_str =
-            "rtspsrc location=rtsp://192.168.144.25:8554/video2 latency=0 ! "
-            "rtph265depay ! h265parse ! "
-            "capsfilter caps=video/x-h265,stream-format=byte-stream ! "
-            "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false";
-
-        RCLCPP_INFO(this->get_logger(), "GStreamer pipeline: %s", pipeline_str.c_str());
+            "rtspsrc location=" + rtsp_url + " latency=0 ! "
+                                             "rtph265depay ! "
+                                             "h265parse ! "
+                                             "capsfilter caps=video/x-h265,stream-format=byte-stream ! "
+                                             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false";
 
         GError* error = nullptr;
-        gst_pipeline_ = gst_parse_launch(pipeline_str.c_str(), &error);
-
-        if (!gst_pipeline_) {
-            RCLCPP_ERROR(this->get_logger(), "GStreamer error: %s",
+        pipeline_ = gst_parse_launch(pipeline_str.c_str(), &error);
+        if (!pipeline_) {
+            RCLCPP_ERROR(this->get_logger(), "GStreamer pipeline creation failed: %s",
                          error ? error->message : "unknown");
             if (error) g_error_free(error);
             return;
         }
 
-        GstElement* sink = gst_bin_get_by_name(GST_BIN(gst_pipeline_), "sink");
-        gst_appsink_ = GST_APP_SINK(sink);
-        gst_object_unref(sink);
+        // --- 5. Получение appsink ---
+        GstElement* sink_elem = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
+        if (!sink_elem) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to get 'sink' element");
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            return;
+        }
+        appsink_ = GST_APP_SINK(sink_elem);
+        gst_object_unref(sink_elem);
 
-        gst_app_sink_set_emit_signals(gst_appsink_, true);
-        gst_app_sink_set_max_buffers(gst_appsink_, 1);
-        gst_app_sink_set_drop(gst_appsink_, true);
+        // --- 6. Настройка appsink ---
+        gst_app_sink_set_emit_signals(appsink_, true);
+        gst_app_sink_set_max_buffers(appsink_, 1);
+        gst_app_sink_set_drop(appsink_, true);
 
-        g_signal_connect(gst_appsink_, "new-sample",
-                         G_CALLBACK(on_new_sample), this);
+        // --- 7. Колбэк ---
+        g_signal_connect(appsink_, "new-sample",
+                         G_CALLBACK(VideoCamera::on_new_sample_static), this);
 
-        gst_element_set_state(gst_pipeline_, GST_STATE_PLAYING);
+        // --- 8. Запуск ---
+        GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to set pipeline to PLAYING");
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+            return;
+        }
 
-        RCLCPP_INFO(this->get_logger(), "VideoCamera Node ready! Publishing H.265 (byte-stream)");
+        RCLCPP_INFO(this->get_logger(), "VideoCamera Node ready!");
     }
 
-    ~VideoCamera() {
-        if (gst_pipeline_) {
-            gst_element_set_state(gst_pipeline_, GST_STATE_NULL);
-            gst_object_unref(gst_pipeline_);
+    ~VideoCamera()
+    {
+        if (pipeline_) {
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+            gst_object_unref(pipeline_);
         }
         RCLCPP_INFO(this->get_logger(), "VideoCamera Node shutdown");
     }
 
 private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher_;
-    GstElement* gst_pipeline_;
-    GstAppSink* gst_appsink_;
-
+    GstElement* pipeline_;
+    GstAppSink* appsink_;
     unsigned int frame_count_;
     rclcpp::Time last_log_time_;
 
-    static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data) {
+    static GstFlowReturn on_new_sample_static(GstAppSink* sink, gpointer user_data)
+    {
         VideoCamera* node = static_cast<VideoCamera*>(user_data);
         return node->process_gst_sample(sink);
     }
 
-    GstFlowReturn process_gst_sample(GstAppSink* sink) {
+    GstFlowReturn process_gst_sample(GstAppSink* sink)
+    {
         GstSample* sample = gst_app_sink_pull_sample(sink);
-        if (!sample) return GST_FLOW_ERROR;
+        if (!sample) {
+            RCLCPP_WARN(this->get_logger(), "Failed to pull sample");
+            return GST_FLOW_ERROR;
+        }
 
         GstBuffer* buffer = gst_sample_get_buffer(sample);
         if (!buffer) {
@@ -104,32 +132,27 @@ private:
 
         publisher_->publish(*msg);
 
-        frame_count_++;
-        if ((this->now() - last_log_time_).seconds() >= 1.0) {
-            RCLCPP_INFO(this->get_logger(), "[H.265] FPS: %d, Size: %.2f KB",
-                        frame_count_, map.size / 1024.0);
-            frame_count_ = 0;
-            last_log_time_ = this->now();
-        }
-
         gst_buffer_unmap(buffer, &map);
         gst_sample_unref(sample);
+
+        frame_count_++;
+        auto now = this->now();
+        if ((now - last_log_time_).seconds() >= 1.0) {
+            RCLCPP_INFO(this->get_logger(), "[VideoCamera] FPS: %d, Frame size: %.2f KB",
+                        frame_count_, map.size / 1024.0);
+            frame_count_ = 0;
+            last_log_time_ = now;
+        }
 
         return GST_FLOW_OK;
     }
 };
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
     rclcpp::init(argc, argv);
-
-    try {
-        auto node = std::make_shared<VideoCamera>();
-        rclcpp::spin(node);
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(rclcpp::get_logger("main"), "Error: %s", e.what());
-        return 1;
-    }
-
+    auto node = std::make_shared<VideoCamera>();
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
