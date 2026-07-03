@@ -5,38 +5,39 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Находим зависимости ROS 2
+# ============================================
+# ПОИСК ЗАВИСИМОСТЕЙ
+# ============================================
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(mavros_msgs REQUIRED)
+find_package(std_msgs REQUIRED)  # <-- ДОБАВИТЬ!
 
 # ============================================
-# ЦЕЛЬ 1: TCP-сервер
+# TCP-КЛИЕНТ
 # ============================================
-add_executable(tcp_server_node src/TCP_pkg_server_node.cpp)
+add_executable(tcp_client_node src/TCP_pkg_client_pkg_node.cpp)
+ament_target_dependencies(tcp_client_node
+    rclcpp
+    std_msgs  # <-- ДОБАВИТЬ!
+)
 
-# Теперь добавляем зависимости после объявления цели
+# ============================================
+# TCP-СЕРВЕР
+# ============================================
+add_executable(tcp_server_node src/TCP_pkg_server_pkg_node.cpp)
 ament_target_dependencies(tcp_server_node
     rclcpp
     mavros_msgs
+    std_msgs  # <-- ДОБАВИТЬ (если тоже использует std_msgs)
 )
 
 # ============================================
-# ЦЕЛЬ 2: TCP-клиент
-# ============================================
-add_executable(tcp_client_node src/TCP_pkg_client_node.cpp)
-
-# И для клиента тоже добавляем зависимости после add_executable
-ament_target_dependencies(tcp_client_node
-    rclcpp
-)
-
-# ============================================
-# Установка и сборка
+# УСТАНОВКА
 # ============================================
 install(TARGETS
-    tcp_server_node
     tcp_client_node
+    tcp_server_node
     DESTINATION lib/${PROJECT_NAME}
 )
 
