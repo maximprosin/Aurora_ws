@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>   // Для состояния камеры
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -6,12 +7,14 @@
 #include <opencv2/opencv.hpp>
 #include <thread>
 #include <array>
+#include <string>
 
 namespace io = boost::asio;
 using io::ip::udp;
 
 /**
  * @brief UDP-клиент для приёма H.265 видео и отображения через OpenCV.
+ *        Дополнительно подписывается на /gimbal/angles для отображения состояния камеры.
  */
 class UdpClientNode : public rclcpp::Node
 {
@@ -22,7 +25,9 @@ public:
         appsrc_(nullptr),
         appsink_(nullptr),
         frame_count_(0),
-        last_log_time_(this->now())
+        last_log_time_(this->now()),
+        current_mode_(0),
+        current_zoom_(0.0f)
     {
         RCLCPP_INFO(this->get_logger(), "=== UDP H.265 CLIENT ===");
 
@@ -118,38 +123,38 @@ public:
             throw std::runtime_error("GStreamer start failed");
         }
 
-        // --- 12. Запуск приёма UDP ---
+        // --- 12. Подписка на топик состояния камеры ---
+        state_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/gimbal/angles", 10,
+            std::bind(&UdpClientNode::state_callback, this, std::placeholders::_1));
+
+        // --- 13. Запуск приёма UDP ---
         start_receive();
 
-        // --- 13. Запуск потока io_context ---
+        // --- 14. Запуск потока io_context ---
         io_thread_ = std::thread([this]() { io_context_.run(); });
 
-        RCLCPP_INFO(this->get_logger(), "UDP Client ready!");
+        RCLCPP_INFO(this->get_logger(), "UDP Client ready! Subscribed to /gimbal/angles");
     }
 
     ~UdpClientNode()
     {
-        // Остановка io_context
         io_context_.stop();
         if (io_thread_.joinable()) {
             io_thread_.join();
         }
 
-        // Закрытие сокета
         if (socket_.is_open()) {
             boost::system::error_code ec;
             socket_.close(ec);
         }
 
-        // Остановка GStreamer пайплайна
         if (pipeline_) {
             gst_element_set_state(pipeline_, GST_STATE_NULL);
             gst_object_unref(pipeline_);
         }
 
-        // Закрытие окон OpenCV
         cv::destroyAllWindows();
-
         RCLCPP_INFO(this->get_logger(), "UDP Client shutdown");
     }
 
@@ -167,6 +172,11 @@ private:
     std::array<char, 65536> recv_buffer_;
     unsigned int frame_count_;
     rclcpp::Time last_log_time_;
+
+    // --- Для состояния камеры ---
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr state_sub_;
+    int current_mode_;
+    float current_zoom_;
 
     // --- Запуск асинхронного приёма ---
     void start_receive()
@@ -189,7 +199,6 @@ private:
                                              "Failed to push buffer to appsrc");
                     }
 
-                    // Статистика
                     frame_count_++;
                     auto now = this->now();
                     if ((now - last_log_time_).seconds() >= 1.0) {
@@ -208,6 +217,17 @@ private:
             );
     }
 
+    // --- Колбэк для получения состояния камеры ---
+    void state_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
+    {
+        if (msg->data.size() >= 4) {
+            // msg->data[0] = pitch, [1] = yaw, [2] = mode, [3] = zoom
+            current_mode_ = static_cast<int>(msg->data[2]);
+            current_zoom_ = msg->data[3];
+            RCLCPP_DEBUG(this->get_logger(), "State update: mode=%d, zoom=%.2f", current_mode_, current_zoom_);
+        }
+    }
+
     // --- Статический колбэк для GStreamer (новый кадр) ---
     static GstFlowReturn on_new_sample_static(GstAppSink* sink, gpointer user_data)
     {
@@ -215,7 +235,7 @@ private:
         return node->process_gst_sample(sink);
     }
 
-    // --- Обработка декодированного кадра ---
+    // --- Обработка декодированного кадра с наложением состояния ---
     GstFlowReturn process_gst_sample(GstAppSink* sink)
     {
         GstSample* sample = gst_app_sink_pull_sample(sink);
@@ -235,8 +255,36 @@ private:
             return GST_FLOW_ERROR;
         }
 
-        // Конвертация в OpenCV Mat и отображение
-        cv::Mat image(cv::Size(640, 480), CV_8UC3, map.data);
+        // --- Определение размера изображения из caps ---
+        GstCaps* caps = gst_sample_get_caps(sample);
+        GstStructure* structure = gst_caps_get_structure(caps, 0);
+        int width, height;
+        gst_structure_get_int(structure, "width", &width);
+        gst_structure_get_int(structure, "height", &height);
+
+        // --- Создание OpenCV Mat ---
+        cv::Mat image(height, width, CV_8UC3, map.data);
+
+        // --- Наложение информации о состоянии ---
+        if (!image.empty()) {
+            // Текст режима
+            std::string mode_str;
+            switch (current_mode_) {
+            case 0: mode_str = "RGB"; break;
+            case 1: mode_str = "Thermal"; break;
+            case 2: mode_str = "Wide"; break;
+            default: mode_str = "Unknown";
+            }
+            std::string info_text = "Mode: " + mode_str + "  Zoom: " + std::to_string(current_zoom_);
+
+            // Параметры текста
+            cv::putText(image, info_text, cv::Point(10, 30),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+            // Можно добавить и углы, если нужно
+            // float pitch = ...; float yaw = ...; (но они не сохраняются в текущей реализации)
+        }
+
+        // --- Отображение ---
         cv::imshow("UDP Video", image);
         cv::waitKey(1);
 

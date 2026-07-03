@@ -20,7 +20,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "=== VideoCamera Node Started ===");
 
         // --- 1. Параметры ---
-        this->declare_parameter<std::string>("rtsp_url", "rtsp://192.168.144.25:8554/video2");
+        this->declare_parameter<std::string>("rtsp_url", "rtsp://192.168.144.25:8554/video1");
         std::string rtsp_url = this->get_parameter("rtsp_url").as_string();
         RCLCPP_INFO(this->get_logger(), "RTSP URL: %s", rtsp_url.c_str());
 
