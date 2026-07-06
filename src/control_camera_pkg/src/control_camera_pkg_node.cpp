@@ -2,6 +2,7 @@
 #include <mavros_msgs/srv/gimbal_manager_pitchyaw.hpp>
 #include <mavros_msgs/msg/gimbal_manager_set_pitchyaw.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <mavros_msgs/srv/command_long.hpp>
 #include <termios.h>
 #include <unistd.h>
@@ -12,6 +13,10 @@
 #include <csignal>
 #include <sstream>
 #include <iomanip>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cstring>
 
 class KeyboardGimbalController : public rclcpp::Node {
 public:
@@ -33,33 +38,11 @@ public:
         this->declare_parameter("service_timeout_sec", 5.0);
         this->declare_parameter("zoom_speed", 0.2f);
 
-        // Параметры для режимов (по умолчанию – MAV_CMD_SET_CAMERA_MODE, 530)
-        this->declare_parameter("rgb_command", 530);
-        this->declare_parameter("rgb_param1", 0.0f);
-        this->declare_parameter("rgb_param2", 0.0f);
-        this->declare_parameter("rgb_param3", 0.0f);
-        this->declare_parameter("rgb_param4", 0.0f);
-        this->declare_parameter("rgb_param5", 0.0f);
-        this->declare_parameter("rgb_param6", 0.0f);
-        this->declare_parameter("rgb_param7", 0.0f);
-
-        this->declare_parameter("thermal_command", 530);
-        this->declare_parameter("thermal_param1", 0.0f);
-        this->declare_parameter("thermal_param2", 1.0f);
-        this->declare_parameter("thermal_param3", 0.0f);
-        this->declare_parameter("thermal_param4", 0.0f);
-        this->declare_parameter("thermal_param5", 0.0f);
-        this->declare_parameter("thermal_param6", 0.0f);
-        this->declare_parameter("thermal_param7", 0.0f);
-
-        this->declare_parameter("wide_command", 530);
-        this->declare_parameter("wide_param1", 0.0f);
-        this->declare_parameter("wide_param2", 2.0f);
-        this->declare_parameter("wide_param3", 0.0f);
-        this->declare_parameter("wide_param4", 0.0f);
-        this->declare_parameter("wide_param5", 0.0f);
-        this->declare_parameter("wide_param6", 0.0f);
-        this->declare_parameter("wide_param7", 0.0f);
+        // Параметры для UDP-команд SiYi
+        this->declare_parameter("camera_ip", "192.168.144.25");
+        this->declare_parameter("camera_port", 14550);
+        this->declare_parameter("vdisp_rgb", 3);          // Single Zoom
+        this->declare_parameter("vdisp_wide_thermal", 5); // Wide или Thermal
 
         // Загрузка параметров
         publish_topic_ = this->get_parameter("publish_topic").as_string();
@@ -76,30 +59,10 @@ public:
         service_timeout_sec_ = this->get_parameter("service_timeout_sec").as_double();
         zoom_speed_ = this->get_parameter("zoom_speed").as_double();
 
-        rgb_command_ = this->get_parameter("rgb_command").as_int();
-        rgb_params_ = {this->get_parameter("rgb_param1").as_double(),
-                       this->get_parameter("rgb_param2").as_double(),
-                       this->get_parameter("rgb_param3").as_double(),
-                       this->get_parameter("rgb_param4").as_double(),
-                       this->get_parameter("rgb_param5").as_double(),
-                       this->get_parameter("rgb_param6").as_double(),
-                       this->get_parameter("rgb_param7").as_double()};
-        thermal_command_ = this->get_parameter("thermal_command").as_int();
-        thermal_params_ = {this->get_parameter("thermal_param1").as_double(),
-                           this->get_parameter("thermal_param2").as_double(),
-                           this->get_parameter("thermal_param3").as_double(),
-                           this->get_parameter("thermal_param4").as_double(),
-                           this->get_parameter("thermal_param5").as_double(),
-                           this->get_parameter("thermal_param6").as_double(),
-                           this->get_parameter("thermal_param7").as_double()};
-        wide_command_ = this->get_parameter("wide_command").as_int();
-        wide_params_ = {this->get_parameter("wide_param1").as_double(),
-                        this->get_parameter("wide_param2").as_double(),
-                        this->get_parameter("wide_param3").as_double(),
-                        this->get_parameter("wide_param4").as_double(),
-                        this->get_parameter("wide_param5").as_double(),
-                        this->get_parameter("wide_param6").as_double(),
-                        this->get_parameter("wide_param7").as_double()};
+        camera_ip_ = this->get_parameter("camera_ip").as_string();
+        camera_port_ = this->get_parameter("camera_port").as_int();
+        vdisp_rgb_ = this->get_parameter("vdisp_rgb").as_int();
+        vdisp_wide_thermal_ = this->get_parameter("vdisp_wide_thermal").as_int();
 
         // ============================================
         // 2. ПУБЛИКАТОРЫ
@@ -108,9 +71,10 @@ public:
             publish_topic_, 10);
         angle_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             angle_publish_topic_, 10);
+        stream_publisher_ = this->create_publisher<std_msgs::msg::Int32>("/set_rtsp_stream", 10);
 
         // ============================================
-        // 3. КЛИЕНТЫ
+        // 3. КЛИЕНТЫ MAVROS
         // ============================================
         client_ = this->create_client<mavros_msgs::srv::GimbalManagerPitchyaw>(service_name_);
         if (!wait_for_service_with_timeout()) {
@@ -152,11 +116,9 @@ public:
         RCLCPP_INFO(this->get_logger(), "  Скорость зума: %.2f", zoom_speed_);
         RCLCPP_INFO(this->get_logger(), "  Наклон (pitch): [%.1f° .. %.1f°]", min_pitch_, max_pitch_);
         RCLCPP_INFO(this->get_logger(), "  Поворот (yaw): [%.1f° .. %.1f°]", min_yaw_, max_yaw_);
-        RCLCPP_INFO(this->get_logger(), "  Команды режимов:");
-        RCLCPP_INFO(this->get_logger(), "    RGB:   cmd=%d, p1=%.1f, p2=%.1f", rgb_command_, rgb_params_[0], rgb_params_[1]);
-        RCLCPP_INFO(this->get_logger(), "    Therm: cmd=%d, p1=%.1f, p2=%.1f", thermal_command_, thermal_params_[0], thermal_params_[1]);
-        RCLCPP_INFO(this->get_logger(), "    Wide:  cmd=%d, p1=%.1f, p2=%.1f", wide_command_, wide_params_[0], wide_params_[1]);
-        RCLCPP_INFO(this->get_logger(), "  Публикация углов в топик: %s", angle_publish_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Камера IP: %s, порт: %d", camera_ip_.c_str(), camera_port_);
+        RCLCPP_INFO(this->get_logger(), "  vdisp RGB (video2): %d", vdisp_rgb_);
+        RCLCPP_INFO(this->get_logger(), "  vdisp Wide/Thermal (video1): %d", vdisp_wide_thermal_);
         print_help();
     }
 
@@ -171,33 +133,32 @@ private:
     // --- Справка ---
     void print_help() {
         RCLCPP_INFO(this->get_logger(), " ");
-        RCLCPP_INFO(this->get_logger(), "📋 Управление камерой:");
-        RCLCPP_INFO(this->get_logger(), "  W/S - наклон вверх/вниз (pitch)");
-        RCLCPP_INFO(this->get_logger(), "  A/D - поворот влево/вправо (yaw)");
-        RCLCPP_INFO(this->get_logger(), "  ПРОБЕЛ - сброс камеры в центр (0°, 0°)");
+        RCLCPP_INFO(this->get_logger(), "📋 Управление подвесом (стрелки):");
+        RCLCPP_INFO(this->get_logger(), "  ↑ - наклон вверх");
+        RCLCPP_INFO(this->get_logger(), "  ↓ - наклон вниз");
+        RCLCPP_INFO(this->get_logger(), "  ← - поворот влево");
+        RCLCPP_INFO(this->get_logger(), "  → - поворот вправо");
+        RCLCPP_INFO(this->get_logger(), "  ПРОБЕЛ - сброс в центр (0°, 0°)");
         RCLCPP_INFO(this->get_logger(), " ");
-        RCLCPP_INFO(this->get_logger(), "📋 Управление зумом (непрерывно):");
-        RCLCPP_INFO(this->get_logger(), "  Z - начать приближение (скорость %.2f)", zoom_speed_);
-        RCLCPP_INFO(this->get_logger(), "  X - начать отдаление (скорость %.2f)", zoom_speed_);
-        RCLCPP_INFO(this->get_logger(), "  C - остановить зум (фиксация в текущем положении)");
+        RCLCPP_INFO(this->get_logger(), "📋 Управление зумом:");
+        RCLCPP_INFO(this->get_logger(), "  Z - приближение");
+        RCLCPP_INFO(this->get_logger(), "  X - отдаление");
+        RCLCPP_INFO(this->get_logger(), "  C - остановить зум");
         RCLCPP_INFO(this->get_logger(), " ");
-        RCLCPP_INFO(this->get_logger(), "📋 Переключение режимов (в рамках video1):");
-        RCLCPP_INFO(this->get_logger(), "  1 - RGB");
-        RCLCPP_INFO(this->get_logger(), "  2 - Thermal");
-        RCLCPP_INFO(this->get_logger(), "  3 - Wide");
-        RCLCPP_INFO(this->get_logger(), "  (параметры команд настраиваются через ROS-параметры)");
+        RCLCPP_INFO(this->get_logger(), "📋 Переключение видеопотоков:");
+        RCLCPP_INFO(this->get_logger(), "  1 - Основной поток video2 (RGB ЗУМ)");
+        RCLCPP_INFO(this->get_logger(), "  2 - Дополнительный поток video1 (WIDE или THERMAL)");
         RCLCPP_INFO(this->get_logger(), " ");
-        RCLCPP_INFO(this->get_logger(), "📋 Настройки параметров:");
-        RCLCPP_INFO(this->get_logger(), "  + / - - увеличить/уменьшить шаг (от 0.5° до 20°)");
+        RCLCPP_INFO(this->get_logger(), "📋 Настройки:");
+        RCLCPP_INFO(this->get_logger(), "  + / - - изменить шаг угла");
+        RCLCPP_INFO(this->get_logger(), "  H/h - справка");
         RCLCPP_INFO(this->get_logger(), "  ESC - выход");
-        RCLCPP_INFO(this->get_logger(), "  H/h - показать эту справку");
         RCLCPP_INFO(this->get_logger(), " ");
         RCLCPP_INFO(this->get_logger(), "📊 Текущий шаг: %.1f°", step_);
         RCLCPP_INFO(this->get_logger(), "📊 Скорость зума: %.2f", zoom_speed_);
-        RCLCPP_INFO(this->get_logger(), "📤 Углы публикуются в: %s", angle_publish_topic_.c_str());
     }
 
-    // --- Вспомогательные методы (исходные, без изменений) ---
+    // --- Вспомогательные методы ---
     bool setup_terminal() {
         if (tcgetattr(STDIN_FILENO, &old_termios_) != 0) {
             RCLCPP_ERROR(this->get_logger(), "Не удалось получить настройки терминала: %s", strerror(errno));
@@ -247,7 +208,7 @@ private:
         return -1;
     }
 
-    // --- Публикация углов (без изменений) ---
+    // --- Публикация углов ---
     void publish_angles(float pitch, float yaw) {
         auto msg = std_msgs::msg::Float32MultiArray();
         msg.data.clear();
@@ -257,7 +218,7 @@ private:
         RCLCPP_DEBUG(this->get_logger(), "📤 Опубликованы углы: Pitch=%.1f, Yaw=%.1f", pitch, yaw);
     }
 
-    // --- Отправка команды подвесу (без изменений) ---
+    // --- Отправка команды подвесу ---
     void send_gimbal_command(float pitch, float yaw) {
         if (pitch < min_pitch_ || pitch > max_pitch_) {
             RCLCPP_WARN(this->get_logger(), "⚠️ Наклон %.1f° выходит за пределы [%.1f°..%.1f°]",
@@ -284,9 +245,9 @@ private:
                                             auto result = future.get();
                                             if (result->result != 0) {
                                                 RCLCPP_WARN(this->get_logger(),
-                                                            "❌ Команда не выполнена: result=%d", result->result);
+                                                            "❌ Команда подвеса не выполнена: result=%d", result->result);
                                             } else {
-                                                RCLCPP_DEBUG(this->get_logger(), "✅ Команда выполнена");
+                                                RCLCPP_DEBUG(this->get_logger(), "✅ Команда подвеса выполнена");
                                             }
                                         });
         } else {
@@ -304,7 +265,9 @@ private:
         publish_angles(pitch, yaw);
     }
 
-    // --- ★ НОВЫЕ МЕТОДЫ ДЛЯ ЗУМА ★ ---
+    // ============================================================
+    // ★ УПРАВЛЕНИЕ ЗУМОМ (MAVLink) ★
+    // ============================================================
     void send_zoom_continuous(float speed) {
         if (!cmd_client_->service_is_ready()) {
             RCLCPP_WARN(this->get_logger(), "⚠️ Сервис /mavros/cmd/command не готов");
@@ -312,165 +275,209 @@ private:
         }
         auto req = std::make_shared<mavros_msgs::srv::CommandLong::Request>();
         req->command = 531;
-        req->param1 = 1.0f;          // непрерывный режим
-        req->param2 = speed;         // положительная = приближение, отрицательная = отдаление
+        req->param1 = 1.0f;
+        req->param2 = std::clamp(speed, -1.0f, 1.0f);
         req->confirmation = 0;
-        cmd_client_->async_send_request(req);
-        RCLCPP_INFO(this->get_logger(), "🔍 Зум: скорость %.2f", speed);
+        cmd_client_->async_send_request(req,
+                                        [this](rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedFuture future) {
+                                            auto result = future.get();
+                                            if (result->success) {
+                                                RCLCPP_DEBUG(this->get_logger(), "✅ Команда зума выполнена успешно");
+                                            } else {
+                                                RCLCPP_WARN(this->get_logger(), "❌ Команда зума не выполнена");
+                                            }
+                                        });
+        RCLCPP_INFO(this->get_logger(), "🔍 Зум: скорость %.2f", req->param2);
     }
 
     void send_zoom_stop() {
         if (!cmd_client_->service_is_ready()) return;
         auto req = std::make_shared<mavros_msgs::srv::CommandLong::Request>();
         req->command = 531;
-        req->param1 = 2.0f;          // остановить
+        req->param1 = 1.0f;
         req->param2 = 0.0f;
         req->confirmation = 0;
-        cmd_client_->async_send_request(req);
+        cmd_client_->async_send_request(req,
+                                        [this](rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedFuture future) {
+                                            auto result = future.get();
+                                            if (result->success) {
+                                                RCLCPP_DEBUG(this->get_logger(), "✅ Остановка зума выполнена");
+                                            } else {
+                                                RCLCPP_WARN(this->get_logger(), "❌ Остановка зума не выполнена");
+                                            }
+                                        });
         RCLCPP_INFO(this->get_logger(), "⏹️ Остановка зума (положение зафиксировано)");
     }
 
-    // --- ★ ФУНКЦИЯ ДЛЯ ПЕРЕКЛЮЧЕНИЯ РЕЖИМОВ (гибкая) ---
-    void send_mode_command(int command, const std::array<double,7>& params) {
-        if (!cmd_client_->service_is_ready()) {
-            RCLCPP_WARN(this->get_logger(), "⚠️ Сервис /mavros/cmd/command не готов");
+    // ============================================================
+    // ★ ПРЯМАЯ UDP-КОМАНДА SiYi (CMD_ID:0x11) ★
+    // ============================================================
+    void send_siyi_command(uint8_t cmd_id, uint8_t data) {
+        int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Не удалось создать UDP-сокет");
             return;
         }
-        auto req = std::make_shared<mavros_msgs::srv::CommandLong::Request>();
-        req->command = command;
-        req->param1 = params[0];
-        req->param2 = params[1];
-        req->param3 = params[2];
-        req->param4 = params[3];
-        req->param5 = params[4];
-        req->param6 = params[5];
-        req->param7 = params[6];
-        req->confirmation = 0;
-        cmd_client_->async_send_request(req);
+
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(camera_port_);
+        if (inet_pton(AF_INET, camera_ip_.c_str(), &server_addr.sin_addr) <= 0) {
+            RCLCPP_ERROR(this->get_logger(), "Неверный IP-адрес: %s", camera_ip_.c_str());
+            close(sockfd);
+            return;
+        }
+
+        uint8_t packet[4] = {0x55, 0x01, cmd_id, data};
+        ssize_t sent = sendto(sockfd, packet, sizeof(packet), 0,
+                              (struct sockaddr*)&server_addr, sizeof(server_addr));
+        close(sockfd);
+
+        if (sent == sizeof(packet)) {
+            RCLCPP_INFO(this->get_logger(), "✅ UDP-команда 0x%02X с data=0x%02X отправлена на %s:%d",
+                        cmd_id, data, camera_ip_.c_str(), camera_port_);
+        } else {
+            RCLCPP_WARN(this->get_logger(), "❌ Не удалось отправить UDP-команду");
+        }
     }
 
-    // --- Обработка клавиш (исходная логика + добавлены Z, X, C, 1, 2, 3) ---
+    // --- Переключение режима изображения через UDP ---
+    void set_image_mode(int vdisp_mode, const std::string& mode_name) {
+        RCLCPP_INFO(this->get_logger(), "📷 Переключение в режим %s (vdisp=%d)", mode_name.c_str(), vdisp_mode);
+        send_siyi_command(0x11, static_cast<uint8_t>(vdisp_mode));
+    }
+
+    // --- Обработка клавиш ---
     void read_keyboard() {
         int key = get_key();
         if (key == -1) return;
+
+        // Обработка стрелок
+        if (key == 27) {
+            if (get_key() == 91) {
+                int arrow_key = get_key();
+                float new_pitch = pitch_;
+                float new_yaw = yaw_;
+                bool command_sent = false;
+
+                switch (arrow_key) {
+                case 65: // ↑
+                    new_pitch = pitch_ + step_;
+                    if (new_pitch > max_pitch_) {
+                        new_pitch = max_pitch_;
+                        RCLCPP_INFO(this->get_logger(), "🔒 Максимум наклона: %.1f°", new_pitch);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "📐 Наклон вверх: %.1f°", new_pitch);
+                    }
+                    command_sent = true;
+                    break;
+                case 66: // ↓
+                    new_pitch = pitch_ - step_;
+                    if (new_pitch < min_pitch_) {
+                        new_pitch = min_pitch_;
+                        RCLCPP_INFO(this->get_logger(), "🔒 Минимум наклона: %.1f°", new_pitch);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "📐 Наклон вниз: %.1f°", new_pitch);
+                    }
+                    command_sent = true;
+                    break;
+                case 67: // →
+                    new_yaw = yaw_ - step_;
+                    if (new_yaw < min_yaw_) {
+                        new_yaw = min_yaw_;
+                        RCLCPP_INFO(this->get_logger(), "🔒 Минимум поворота: %.1f°", new_yaw);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "📐 Поворот вправо: %.1f°", new_yaw);
+                    }
+                    command_sent = true;
+                    break;
+                case 68: // ←
+                    new_yaw = yaw_ + step_;
+                    if (new_yaw > max_yaw_) {
+                        new_yaw = max_yaw_;
+                        RCLCPP_INFO(this->get_logger(), "🔒 Максимум поворота: %.1f°", new_yaw);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(), "📐 Поворот влево: %.1f°", new_yaw);
+                    }
+                    command_sent = true;
+                    break;
+                default:
+                    break;
+                }
+
+                if (command_sent) {
+                    pitch_ = new_pitch;
+                    yaw_ = new_yaw;
+                    send_gimbal_command(pitch_, yaw_);
+                }
+                return;
+            }
+            // ESC
+            RCLCPP_INFO(this->get_logger(), "⏹️ Выход...");
+            running_ = false;
+            rclcpp::shutdown();
+            return;
+        }
 
         float new_pitch = pitch_;
         float new_yaw = yaw_;
         bool command_sent = false;
 
         switch (key) {
-        case 'W':
-        case 'w':
-            new_pitch = pitch_ + step_;
-            if (new_pitch > max_pitch_) {
-                new_pitch = max_pitch_;
-                RCLCPP_INFO(this->get_logger(), "🔒 Достигнут максимум наклона: %.1f°", new_pitch);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "📐 Наклон вверх: %.1f°", new_pitch);
-            }
-            command_sent = true;
-            break;
-        case 'S':
-        case 's':
-            new_pitch = pitch_ - step_;
-            if (new_pitch < min_pitch_) {
-                new_pitch = min_pitch_;
-                RCLCPP_INFO(this->get_logger(), "🔒 Достигнут минимум наклона: %.1f°", new_pitch);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "📐 Наклон вниз: %.1f°", new_pitch);
-            }
-            command_sent = true;
-            break;
-        case 'A':
-        case 'a':
-            new_yaw = yaw_ + step_;
-            if (new_yaw > max_yaw_) {
-                new_yaw = max_yaw_;
-                RCLCPP_INFO(this->get_logger(), "🔒 Достигнут максимум поворота: %.1f°", new_yaw);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "📐 Поворот влево: %.1f°", new_yaw);
-            }
-            command_sent = true;
-            break;
-        case 'D':
-        case 'd':
-            new_yaw = yaw_ - step_;
-            if (new_yaw < min_yaw_) {
-                new_yaw = min_yaw_;
-                RCLCPP_INFO(this->get_logger(), "🔒 Достигнут минимум поворота: %.1f°", new_yaw);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "📐 Поворот вправо: %.1f°", new_yaw);
-            }
-            command_sent = true;
-            break;
         case ' ':
             new_pitch = 0.0f;
             new_yaw = 0.0f;
-            RCLCPP_INFO(this->get_logger(), "🔄 Сброс камеры в центр (0°, 0°)");
+            RCLCPP_INFO(this->get_logger(), "🔄 Сброс в центр (0°, 0°)");
             command_sent = true;
             break;
 
-        // ★ Зум ★
-        case 'Z':
-        case 'z':
-            send_zoom_continuous(zoom_speed_);   // приближение
-            command_sent = false;
+        // Зум
+        case 'Z': case 'z':
+            send_zoom_continuous(zoom_speed_);
             break;
-        case 'X':
-        case 'x':
-            send_zoom_continuous(-zoom_speed_);  // отдаление
-            command_sent = false;
+        case 'X': case 'x':
+            send_zoom_continuous(-zoom_speed_);
             break;
-        case 'C':
-        case 'c':
+        case 'C': case 'c':
             send_zoom_stop();
-            command_sent = false;
             break;
 
-        // ★ Режимы ★
+        // ★ ПЕРЕКЛЮЧЕНИЕ МЕЖДУ ДВУМЯ ПОТОКАМИ ★
         case '1':
-            RCLCPP_INFO(this->get_logger(), "📷 Переключение в режим RGB");
-            send_mode_command(rgb_command_, rgb_params_);
-            command_sent = false;
+            set_image_mode(vdisp_rgb_, "RGB ЗУМ");
+            {
+                auto msg = std_msgs::msg::Int32();
+                msg.data = 1; // video2
+                stream_publisher_->publish(msg);
+                RCLCPP_INFO(this->get_logger(), "📺 Основной поток video2 (RGB ЗУМ)");
+            }
             break;
         case '2':
-            RCLCPP_INFO(this->get_logger(), "🌡️ Переключение в режим Thermal");
-            send_mode_command(thermal_command_, thermal_params_);
-            command_sent = false;
-            break;
-        case '3':
-            RCLCPP_INFO(this->get_logger(), "📐 Переключение в режим Wide");
-            send_mode_command(wide_command_, wide_params_);
-            command_sent = false;
+            set_image_mode(vdisp_wide_thermal_, "WIDE или THERMAL");
+            {
+                auto msg = std_msgs::msg::Int32();
+                msg.data = 0; // video1
+                stream_publisher_->publish(msg);
+                RCLCPP_INFO(this->get_logger(), "📺 Дополнительный поток video1 (WIDE или THERMAL)");
+            }
             break;
 
-        // ★ Настройки ★
-        case '+':
-        case '=':
+        // Настройки
+        case '+': case '=':
             if (step_ < 20.0) {
                 step_ += 0.5;
-                RCLCPP_INFO(this->get_logger(), "📏 Шаг увеличен. Новый шаг: %.1f°", step_);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "⚠️ Шаг уже максимальный (20.0°)");
+                RCLCPP_INFO(this->get_logger(), "📏 Шаг: %.1f°", step_);
             }
             break;
-        case '-':
-        case '_':
+        case '-': case '_':
             if (step_ > 0.5) {
                 step_ -= 0.5;
-                RCLCPP_INFO(this->get_logger(), "📏 Шаг уменьшен. Новый шаг: %.1f°", step_);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "⚠️ Шаг уже минимальный (0.5°)");
+                RCLCPP_INFO(this->get_logger(), "📏 Шаг: %.1f°", step_);
             }
             break;
-        case 'H':
-        case 'h':
+        case 'H': case 'h':
             print_help();
-            break;
-        case 27: // ESC
-            RCLCPP_INFO(this->get_logger(), "⏹️ Выход...");
-            running_ = false;
-            rclcpp::shutdown();
             break;
         default:
             break;
@@ -498,14 +505,15 @@ private:
     double min_yaw_;
     int keyboard_poll_rate_hz_;
     double service_timeout_sec_;
-    double zoom_speed_;   // скорость зума
+    double zoom_speed_;
 
-    // Параметры для режимов
-    int rgb_command_, thermal_command_, wide_command_;
-    std::array<double,7> rgb_params_, thermal_params_, wide_params_;
+    std::string camera_ip_;
+    int camera_port_;
+    int vdisp_rgb_, vdisp_wide_thermal_;
 
     rclcpp::Publisher<mavros_msgs::msg::GimbalManagerSetPitchyaw>::SharedPtr publisher_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr angle_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr stream_publisher_;
     rclcpp::Client<mavros_msgs::srv::GimbalManagerPitchyaw>::SharedPtr client_;
     rclcpp::Client<mavros_msgs::srv::CommandLong>::SharedPtr cmd_client_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -522,7 +530,7 @@ int main(int argc, char* argv[]) {
         auto node = std::make_shared<KeyboardGimbalController>();
         rclcpp::spin(node);
     } catch (const std::exception& e) {
-        RCLCPP_ERROR(rclcpp::get_logger("main"), "❌ Критическая ошибка: %s", e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("main"), "❌ Ошибка: %s", e.what());
         return 1;
     }
     rclcpp::shutdown();
