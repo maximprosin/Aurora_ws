@@ -1,24 +1,24 @@
 #include <rclcpp/rclcpp.hpp>
 #include <mavros_msgs/msg/gimbal_manager_set_pitchyaw.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp>  // Для публикации
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>        // Для fcntl
 #include <thread>
 #include <vector>
 #include <mutex>
 #include <cstring>
 #include <string>
 #include <errno.h>
+#include <atomic>
 
 class TcpGimbalServer : public rclcpp::Node {
 public:
     TcpGimbalServer() : Node("tcp_gimbal_server"), server_fd_(-1), running_(true) {
-        // ============================================
-        // 1. ПАРАМЕТРИЗАЦИЯ
-        // ============================================
-        this->declare_parameter("server_ip", "127.0.0.1");
+        // Параметры
+        this->declare_parameter("server_ip", "0.0.0.0");  // Слушаем все интерфейсы
         this->declare_parameter("server_port", 5005);
         this->declare_parameter("max_clients", 10);
 
@@ -26,27 +26,22 @@ public:
         server_port_ = this->get_parameter("server_port").as_int();
         max_clients_ = this->get_parameter("max_clients").as_int();
 
-        // ============================================
-        // 2. ПОДПИСКА НА ТОПИК С КОМАНДАМИ
-        // ============================================
+        // Подписка на команды
         subscription_ = this->create_subscription<mavros_msgs::msg::GimbalManagerSetPitchyaw>(
             "/gimbal/commands", 10,
             std::bind(&TcpGimbalServer::gimbal_callback, this, std::placeholders::_1));
 
-        // ============================================
-        // 3. ПУБЛИКАТОР ДЛЯ ЛОГИРОВАНИЯ (опционально)
-        // ============================================
         angle_publisher_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "/server_received/angles", 10);
 
-        // ============================================
-        // 4. ЗАПУСК СЕРВЕРА
-        // ============================================
-        start_server(server_ip_, server_port_);
-        RCLCPP_INFO(this->get_logger(), "✅ TCP-сервер запущен на %s:%d",
-                    server_ip_.c_str(), server_port_);
+        // Запуск сервера
+        if (!start_server(server_ip_, server_port_)) {
+            RCLCPP_ERROR(this->get_logger(), "Не удалось запустить сервер");
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "✅ TCP-сервер запущен на %s:%d", server_ip_.c_str(), server_port_);
         RCLCPP_INFO(this->get_logger(), "📋 Ожидание команд в топике /gimbal/commands");
-        RCLCPP_INFO(this->get_logger(), "📤 Отправка клиентам в формате: PITCH:xxx,YAW:xxx");
     }
 
     ~TcpGimbalServer() {
@@ -54,33 +49,28 @@ public:
         if (accept_thread_.joinable()) {
             accept_thread_.join();
         }
-        // Закрываем все клиентские сокеты
+
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (int client : clients_) {
                 if (client != -1) {
                     close(client);
-                    RCLCPP_DEBUG(this->get_logger(), "Клиентский сокет закрыт");
                 }
             }
             clients_.clear();
         }
+
         if (server_fd_ != -1) {
             close(server_fd_);
-            RCLCPP_DEBUG(this->get_logger(), "Серверный сокет закрыт");
         }
     }
 
 private:
-    // ============================================
-    // ЗАПУСК СЕРВЕРА
-    // ============================================
-    void start_server(const std::string& ip, int port) {
+    bool start_server(const std::string& ip, int port) {
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ == -1) {
-            RCLCPP_ERROR(this->get_logger(), "Не удалось создать сокет: %s (errno=%d)",
-                         strerror(errno), errno);
-            return;
+            RCLCPP_ERROR(this->get_logger(), "Не удалось создать сокет: %s", strerror(errno));
+            return false;
         }
 
         int opt = 1;
@@ -97,61 +87,61 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Неверный IP-адрес: %s", ip.c_str());
             close(server_fd_);
             server_fd_ = -1;
-            return;
+            return false;
         }
 
         if (bind(server_fd_, (struct sockaddr*)&address, sizeof(address)) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Ошибка привязки к %s:%d: %s (errno=%d)",
-                         ip.c_str(), port, strerror(errno), errno);
+            RCLCPP_ERROR(this->get_logger(), "Ошибка привязки к %s:%d: %s", ip.c_str(), port, strerror(errno));
             close(server_fd_);
             server_fd_ = -1;
-            return;
+            return false;
         }
 
         if (listen(server_fd_, max_clients_) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Ошибка прослушивания порта: %s (errno=%d)",
-                         strerror(errno), errno);
+            RCLCPP_ERROR(this->get_logger(), "Ошибка прослушивания порта: %s", strerror(errno));
             close(server_fd_);
             server_fd_ = -1;
-            return;
+            return false;
+        }
+
+        // 🟢 Устанавливаем неблокирующий режим для серверного сокета
+        int flags = fcntl(server_fd_, F_GETFL, 0);
+        if (flags == -1 || fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) == -1) {
+            RCLCPP_WARN(this->get_logger(), "Не удалось установить неблокирующий режим для серверного сокета");
         }
 
         accept_thread_ = std::thread(&TcpGimbalServer::accept_clients, this);
+        return true;
     }
 
-    // ============================================
-    // ПРИЁМ КЛИЕНТОВ
-    // ============================================
     void accept_clients() {
         while (running_ && rclcpp::ok()) {
             struct sockaddr_in client_addr;
             socklen_t addrlen = sizeof(client_addr);
 
-            // Таймаут для неблокирующего выхода
-            struct timeval tv;
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
-            setsockopt(server_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
             int client_socket = accept(server_fd_, (struct sockaddr*)&client_addr, &addrlen);
 
             if (client_socket < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
                 }
                 if (errno != EINTR) {
-                    RCLCPP_WARN(this->get_logger(), "Ошибка accept(): %s (errno=%d)",
-                                strerror(errno), errno);
+                    RCLCPP_WARN(this->get_logger(), "Ошибка accept(): %s", strerror(errno));
                 }
                 continue;
             }
 
-            // Проверяем лимит клиентов
+            // 🟢 Устанавливаем неблокирующий режим для клиентского сокета
+            int flags = fcntl(client_socket, F_GETFL, 0);
+            if (flags != -1) {
+                fcntl(client_socket, F_SETFL, flags | O_NONBLOCK);
+            }
+
             {
                 std::lock_guard<std::mutex> lock(clients_mutex_);
                 if (clients_.size() >= static_cast<size_t>(max_clients_)) {
-                    RCLCPP_WARN(this->get_logger(), "Достигнут лимит клиентов (%d). Отклоняем подключение.",
-                                max_clients_);
+                    RCLCPP_WARN(this->get_logger(), "Достигнут лимит клиентов. Отклоняем.");
                     close(client_socket);
                     continue;
                 }
@@ -163,37 +153,23 @@ private:
             {
                 std::lock_guard<std::mutex> lock(clients_mutex_);
                 clients_.push_back(client_socket);
-                RCLCPP_INFO(this->get_logger(), "✅ Новый клиент подключен: %s (всего: %zu)",
-                            client_ip, clients_.size());
+                RCLCPP_INFO(this->get_logger(), "✅ Новый клиент: %s (всего: %zu)", client_ip, clients_.size());
             }
         }
     }
 
-    // ============================================
-    // ПУБЛИКАЦИЯ ПОЛУЧЕННЫХ ДАННЫХ
-    // ============================================
     void publish_received_angles(float pitch, float yaw) {
         auto msg = std_msgs::msg::Float32MultiArray();
         msg.data.clear();
         msg.data.push_back(pitch);
         msg.data.push_back(yaw);
         angle_publisher_->publish(msg);
-        RCLCPP_DEBUG(this->get_logger(), "📤 Опубликованы углы в /server_received/angles: Pitch=%.2f, Yaw=%.2f",
-                     pitch, yaw);
     }
 
-    // ============================================
-    // ОБРАБОТКА КОМАНД ИЗ ТОПИКА
-    // ============================================
     void gimbal_callback(const mavros_msgs::msg::GimbalManagerSetPitchyaw::SharedPtr msg) {
-        // ЛОГИРОВАНИЕ ПОЛУЧЕНИЯ ДАННЫХ
-        RCLCPP_INFO(this->get_logger(), "📥 Получена команда: Pitch=%.2f, Yaw=%.2f",
-                    msg->pitch, msg->yaw);
-
-        // Публикуем полученные данные (опционально)
+        RCLCPP_INFO(this->get_logger(), "📥 Получена команда: Pitch=%.2f, Yaw=%.2f", msg->pitch, msg->yaw);
         publish_received_angles(msg->pitch, msg->yaw);
 
-        // Формируем сообщение для отправки клиентам
         char buffer[256];
         int len = snprintf(buffer, sizeof(buffer), "PITCH:%.2f,YAW:%.2f\n", msg->pitch, msg->yaw);
 
@@ -204,38 +180,30 @@ private:
 
         std::lock_guard<std::mutex> lock(clients_mutex_);
 
-        // ЛОГИРОВАНИЕ КОЛИЧЕСТВА КЛИЕНТОВ
         if (clients_.empty()) {
-            RCLCPP_WARN(this->get_logger(), "⚠️ Нет подключенных клиентов для отправки данных");
+            RCLCPP_DEBUG(this->get_logger(), "Нет клиентов для отправки");
             return;
         }
 
-        RCLCPP_DEBUG(this->get_logger(), "📤 Отправка '%s' %zu клиентам", buffer, clients_.size());
-
-        // Отправляем данные всем клиентам
         for (auto it = clients_.begin(); it != clients_.end();) {
             int client = *it;
-            ssize_t bytes_sent = send(client, buffer, strlen(buffer), MSG_NOSIGNAL);
+            ssize_t bytes_sent = send(client, buffer, strlen(buffer), MSG_NOSIGNAL | MSG_DONTWAIT);
 
             if (bytes_sent < 0) {
-                RCLCPP_WARN(this->get_logger(), "Клиент отключился (send error: %s). Удаляем.",
-                            strerror(errno));
-                close(client);
-                it = clients_.erase(it);
-            } else if (static_cast<size_t>(bytes_sent) != strlen(buffer)) {
-                RCLCPP_WARN(this->get_logger(), "Отправлено неполное сообщение: %zd из %zu байт",
-                            bytes_sent, strlen(buffer));
-                ++it;
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    RCLCPP_WARN(this->get_logger(), "Клиент отключился (send: %s). Удаляем.", strerror(errno));
+                    close(client);
+                    it = clients_.erase(it);
+                } else {
+                    ++it;
+                }
             } else {
-                RCLCPP_DEBUG(this->get_logger(), "✅ Отправлено %zu байт клиенту", strlen(buffer));
+                RCLCPP_DEBUG(this->get_logger(), "✅ Отправлено %zd байт", bytes_sent);
                 ++it;
             }
         }
     }
 
-    // ============================================
-    // ПЕРЕМЕННЫЕ
-    // ============================================
     std::string server_ip_;
     int server_port_;
     int max_clients_;
@@ -252,13 +220,8 @@ private:
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    try {
-        auto node = std::make_shared<TcpGimbalServer>();
-        rclcpp::spin(node);
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(rclcpp::get_logger("main"), "Критическая ошибка: %s", e.what());
-        return 1;
-    }
+    auto node = std::make_shared<TcpGimbalServer>();
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
