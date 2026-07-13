@@ -13,98 +13,211 @@
 #include <sstream>
 #include <iomanip>
 #include <map>
-
-// ============================================
-// НАСТРОЙКИ ПОДКЛЮЧЕНИЯ
-// ============================================
-const std::string SERVER_IP = "192.168.31.64";  // IP сервера (2-й ПК)
-const int SERVER_PORT = 6000;                    // Порт сервера
-
-std::atomic<bool> running(true);
-int sockfd = -1;
+#include <chrono>
 
 class TcpClientNode : public rclcpp::Node {
 public:
-    TcpClientNode() : Node("tcp_client_node") {
-        // Публикаторы для отправки команд в ROS 2
+    TcpClientNode() : Node("tcp_client_node"), sockfd_(-1), running_(true) {
+        this->declare_parameter("server_ip", "192.168.31.64");
+        this->declare_parameter("server_port", 6000);
+        this->declare_parameter("reconnect_delay_sec", 3.0);
+        this->declare_parameter("max_reconnect_attempts", 300);
+
+        server_ip_ = this->get_parameter("server_ip").as_string();
+        server_port_ = this->get_parameter("server_port").as_int();
+        reconnect_delay_ = this->get_parameter("reconnect_delay_sec").as_double();
+        max_reconnect_attempts_ = this->get_parameter("max_reconnect_attempts").as_int();
+
+        RCLCPP_INFO(this->get_logger(), "=== TCP-клиент запущен с параметрами ===");
+        RCLCPP_INFO(this->get_logger(), "  server_ip: %s", server_ip_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  server_port: %d", server_port_);
+        RCLCPP_INFO(this->get_logger(), "  reconnect_delay: %.1f сек", reconnect_delay_);
+        RCLCPP_INFO(this->get_logger(), "  max_reconnect_attempts: %d", max_reconnect_attempts_);
+
         telega_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/telega_commands", 10);
         camera_cmd_pub_ = this->create_publisher<std_msgs::msg::String>("/camera_control", 10);
 
-        RCLCPP_INFO(this->get_logger(), "📤 Публикация команд тележки в: /telega_commands");
-        RCLCPP_INFO(this->get_logger(), "📤 Публикация команд камеры в: /camera_control");
+        reconnect_thread_ = std::thread(&TcpClientNode::reconnect_loop, this);
+    }
+
+    ~TcpClientNode() {
+        running_ = false;
+        if (sockfd_ != -1) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
+        if (reconnect_thread_.joinable())
+            reconnect_thread_.join();
+        if (read_thread_.joinable())
+            read_thread_.join();
+        RCLCPP_INFO(this->get_logger(), "🛑 TCP-клиент остановлен");
+    }
+
+private:
+    void reconnect_loop() {
+        int attempt = 0;
+        while (running_ && rclcpp::ok()) {
+            if (sockfd_ == -1) {
+                attempt++;
+                RCLCPP_INFO(this->get_logger(), "Попытка подключения %d к %s:%d...",
+                            attempt, server_ip_.c_str(), server_port_);
+                if (connect_to_server()) {
+                    RCLCPP_INFO(this->get_logger(), "✅ Подключено к серверу %s:%d",
+                                server_ip_.c_str(), server_port_);
+                    attempt = 0;
+                    if (read_thread_.joinable())
+                        read_thread_.join();
+                    read_thread_ = std::thread(&TcpClientNode::read_from_server, this);
+                } else {
+                    if (max_reconnect_attempts_ > 0 && attempt >= max_reconnect_attempts_) {
+                        RCLCPP_ERROR(this->get_logger(), "❌ Достигнут лимит попыток. Завершение.");
+                        rclcpp::shutdown();
+                        return;
+                    }
+                    RCLCPP_WARN(this->get_logger(), "Не удалось подключиться, повтор через %.1f сек...",
+                                reconnect_delay_);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                        static_cast<int>(reconnect_delay_ * 1000)));
+                }
+            } else {
+                if (!is_connected()) {
+                    RCLCPP_WARN(this->get_logger(), "Соединение потеряно. Переподключение...");
+                    close(sockfd_);
+                    sockfd_ = -1;
+                    if (read_thread_.joinable())
+                        read_thread_.join();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+        }
+    }
+
+    bool connect_to_server() {
+        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd_ == -1) {
+            RCLCPP_ERROR(this->get_logger(), "Не удалось создать сокет: %s", strerror(errno));
+            return false;
+        }
+
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(server_port_);
+
+        if (inet_pton(AF_INET, server_ip_.c_str(), &server_addr.sin_addr) <= 0) {
+            RCLCPP_ERROR(this->get_logger(), "Неверный IP-адрес: %s", server_ip_.c_str());
+            close(sockfd_);
+            sockfd_ = -1;
+            return false;
+        }
+
+        if (connect(sockfd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "Ошибка подключения: %s", strerror(errno));
+            close(sockfd_);
+            sockfd_ = -1;
+            return false;
+        }
+
+        int flags = fcntl(sockfd_, F_GETFL, 0);
+        if (flags != -1) {
+            fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        // ==========================================
+        // ОТПРАВЛЯЕМ ПРИВЕТСТВИЕ СЕРВЕРУ
+        // ==========================================
+        std::string hello = "HELLO\n";
+        if (send(sockfd_, hello.c_str(), hello.length(), 0) < 0) {
+            RCLCPP_WARN(this->get_logger(), "Не удалось отправить приветствие: %s", strerror(errno));
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Отправлено приветствие серверу");
+        }
+
+        return true;
+    }
+
+    bool is_connected() {
+        if (sockfd_ == -1) return false;
+        char buffer[1];
+        ssize_t ret = recv(sockfd_, buffer, 0, MSG_DONTWAIT | MSG_PEEK);
+        if (ret == 0) return false;
+        if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        return true;
+    }
+
+    void read_from_server() {
+        char buffer[4096];
+        std::string partial_line;
+
+        RCLCPP_INFO(this->get_logger(), "📡 Начало чтения данных от сервера");
+
+        while (running_ && sockfd_ != -1 && rclcpp::ok()) {
+            memset(buffer, 0, sizeof(buffer));
+            ssize_t bytes_read = recv(sockfd_, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
+
+            if (bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                std::string data = partial_line + std::string(buffer);
+                partial_line.clear();
+
+                std::istringstream stream(data);
+                std::string line;
+
+                while (std::getline(stream, line)) {
+                    line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+                    if (!line.empty()) {
+                        process_server_message(line);
+                    }
+                }
+            }
+            else if (bytes_read == 0) {
+                RCLCPP_WARN(this->get_logger(), "Сервер закрыл соединение");
+                break;
+            }
+            else {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    RCLCPP_WARN(this->get_logger(), "Ошибка чтения: %s", strerror(errno));
+                    break;
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        if (sockfd_ != -1) {
+            close(sockfd_);
+            sockfd_ = -1;
+        }
+        RCLCPP_INFO(this->get_logger(), "Поток чтения завершён");
     }
 
     void process_server_message(const std::string& line) {
+        // Игнорируем приветствие от сервера, если оно есть
+        if (line == "HELLO") return;
+
         auto msg = std_msgs::msg::String();
 
-        // Обработка команд от сервера
         if (line.find("KEY:") == 0) {
             std::string key_info = line.substr(4);
-
-            // Маппинг клавиш в команды
-            std::map<std::string, std::string> key_mapping;
-            // Тележка
-            key_mapping["W:press"] = "w";
-            key_mapping["S:press"] = "s";
-            key_mapping["A:press"] = "a";
-            key_mapping["D:press"] = "d";
-            key_mapping["Q:press"] = "q";
-            key_mapping["R:press"] = "r";
-            key_mapping["F:press"] = "f";
-            key_mapping["SPACE:press"] = " ";
-            // Камера
-            key_mapping["UP:press"] = "UP";
-            key_mapping["DOWN:press"] = "DOWN";
-            key_mapping["LEFT:press"] = "LEFT";
-            key_mapping["RIGHT:press"] = "RIGHT";
-            key_mapping["PLUS:press"] = "PLUS";
-            key_mapping["MINUS:press"] = "MINUS";
-            key_mapping["Z:press"] = "Z";
-            key_mapping["X:press"] = "X";
-            key_mapping["C:press"] = "C";
-
+            std::map<std::string, std::string> key_mapping = {
+                {"W:press", "w"}, {"S:press", "s"}, {"A:press", "a"}, {"D:press", "d"},
+                {"Q:press", "q"}, {"R:press", "r"}, {"F:press", "f"}, {"SPACE:press", " "},
+                {"UP:press", "UP"}, {"DOWN:press", "DOWN"}, {"LEFT:press", "LEFT"}, {"RIGHT:press", "RIGHT"},
+                {"PLUS:press", "PLUS"}, {"MINUS:press", "MINUS"},
+                {"Z:press", "Z"}, {"X:press", "X"}, {"C:press", "C"}
+            };
             auto it = key_mapping.find(key_info);
             if (it != key_mapping.end()) {
                 std::string command = it->second;
                 msg.data = command;
-
-                // Определяем тип команды и публикуем в нужный топик
-                if (command == "UP" || command == "DOWN" ||
-                    command == "LEFT" || command == "RIGHT" ||
-                    command == "PLUS" || command == "MINUS" ||
-                    command == "Z" || command == "X" || command == "C") {
-                    // Команда камеры
+                if (command == "UP" || command == "DOWN" || command == "LEFT" || command == "RIGHT" ||
+                    command == "PLUS" || command == "MINUS" || command == "Z" || command == "X" || command == "C") {
                     camera_cmd_pub_->publish(msg);
-                    RCLCPP_INFO(this->get_logger(), "📷 Отправлена команда камере: '%s'", command.c_str());
+                    RCLCPP_INFO(this->get_logger(), "📷 Команда камере: '%s'", command.c_str());
                 } else {
-                    // Команда тележки
                     telega_cmd_pub_->publish(msg);
-                    RCLCPP_INFO(this->get_logger(), "🚜 Отправлена команда тележке: '%s'", command.c_str());
-                }
-
-                // Вывод на экран
-                std::map<std::string, std::string> display;
-                display["w"] = "🚜 ВПЕРЁД";
-                display["s"] = "🚜 НАЗАД";
-                display["a"] = "🚜 НАЛЕВО";
-                display["d"] = "🚜 НАПРАВО";
-                display["q"] = "🚜 КРУИЗ-КОНТРОЛЬ";
-                display["r"] = "🚜 СКОРОСТЬ +";
-                display["f"] = "🚜 СКОРОСТЬ -";
-                display[" "] = "🚜 СТОП";
-                display["UP"] = "📷 НАКЛОН ВВЕРХ";
-                display["DOWN"] = "📷 НАКЛОН ВНИЗ";
-                display["LEFT"] = "📷 ПОВОРОТ НАЛЕВО";
-                display["RIGHT"] = "📷 ПОВОРОТ НАПРАВО";
-                display["PLUS"] = "📷 ПРИБЛИЖЕНИЕ";
-                display["MINUS"] = "📷 ОТДАЛЕНИЕ";
-                display["Z"] = "📷 ЗУМ +";
-                display["X"] = "📷 ЗУМ -";
-                display["C"] = "📷 СТОП ЗУМ";
-
-                auto disp_it = display.find(command);
-                if (disp_it != display.end()) {
-                    std::cout << "⌨️  " << disp_it->second << std::endl;
+                    RCLCPP_INFO(this->get_logger(), "🚜 Команда тележке: '%s'", command.c_str());
                 }
             }
         }
@@ -112,165 +225,37 @@ public:
             std::string cmd = line.substr(7);
             msg.data = cmd;
             telega_cmd_pub_->publish(msg);
-            RCLCPP_INFO(this->get_logger(), "🚜 TCP команда тележке: '%s'", cmd.c_str());
+            RCLCPP_INFO(this->get_logger(), "🚜 TCP TELEGA: '%s'", cmd.c_str());
         }
         else if (line.find("CAMERA:") == 0) {
             std::string cmd = line.substr(7);
             msg.data = cmd;
             camera_cmd_pub_->publish(msg);
-            RCLCPP_INFO(this->get_logger(), "📷 TCP команда камере: '%s'", cmd.c_str());
+            RCLCPP_INFO(this->get_logger(), "📷 TCP CAMERA: '%s'", cmd.c_str());
+        }
+        else {
+            RCLCPP_DEBUG(this->get_logger(), "Неизвестная команда: %s", line.c_str());
         }
     }
 
-private:
+    std::string server_ip_;
+    int server_port_;
+    double reconnect_delay_;
+    int max_reconnect_attempts_;
+
+    int sockfd_;
+    std::atomic<bool> running_;
+    std::thread reconnect_thread_;
+    std::thread read_thread_;
+
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr telega_cmd_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr camera_cmd_pub_;
 };
 
-// ============================================
-// ПОТОК ЧТЕНИЯ ОТ СЕРВЕРА
-// ============================================
-void server_read_thread(std::shared_ptr<TcpClientNode> node) {
-    char buffer[4096];
-    std::string partial_line;
-
-    std::cout << "\n=================================================" << std::endl;
-    std::cout << "ОЖИДАНИЕ ДАННЫХ ОТ СЕРВЕРА" << std::endl;
-    std::cout << "=================================================" << std::endl;
-    std::cout << "📡 Клиент подключен и слушает сервер..." << std::endl;
-    std::cout << "   Команды с сервера передаются в ROS 2 топики\n" << std::endl;
-
-    while (running && sockfd != -1 && rclcpp::ok()) {
-        memset(buffer, 0, sizeof(buffer));
-        ssize_t bytes_read = recv(sockfd, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
-
-        if (bytes_read > 0) {
-            buffer[bytes_read] = '\0';
-            std::string data = partial_line + std::string(buffer);
-            partial_line.clear();
-
-            std::istringstream stream(data);
-            std::string line;
-
-            while (std::getline(stream, line)) {
-                line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
-
-                if (!line.empty()) {
-                    // Отправляем в ROS 2
-                    node->process_server_message(line);
-
-                    // Дополнительный вывод для данных камеры и тележки
-                    if (line.find("CAMERA:") == 0 && line.find(",") != std::string::npos) {
-                        std::string values = line.substr(7);
-                        size_t comma = values.find(',');
-                        if (comma != std::string::npos) {
-                            std::string pitch_str = values.substr(0, comma);
-                            std::string yaw_str = values.substr(comma + 1);
-                            std::cout << "📷 КАМЕРА | Наклон: " << std::setw(7) << pitch_str
-                                      << "° | Поворот: " << std::setw(7) << yaw_str << "°" << std::endl;
-                        }
-                    }
-                    else if (line.find("TELEOP:") == 0) {
-                        std::string values = line.substr(7);
-                        size_t comma = values.find(',');
-                        if (comma != std::string::npos) {
-                            std::string linear_str = values.substr(0, comma);
-                            std::string angular_str = values.substr(comma + 1);
-                            std::cout << "🚜 ТЕЛЕЖКА | Скорость: " << std::setw(7) << linear_str
-                                      << " | Поворот: " << std::setw(7) << angular_str << std::endl;
-                        }
-                    }
-                }
-            }
-        }
-        else if (bytes_read == 0) {
-            std::cout << "\n❌ Сервер отключился" << std::endl;
-            running = false;
-            break;
-        }
-        else {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                std::cerr << "❌ Ошибка чтения: " << strerror(errno) << std::endl;
-                running = false;
-                break;
-            }
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
-
-// ============================================
-// ГЛАВНАЯ ФУНКЦИЯ
-// ============================================
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-
-    std::cout << "========================================" << std::endl;
-    std::cout << "   TCP КЛИЕНТ ДЛЯ РОБОТА (ROS 2)" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "Подключение к серверу " << SERVER_IP << ":" << SERVER_PORT << "..." << std::endl;
-
-    // Создаём ROS 2 узел
     auto node = std::make_shared<TcpClientNode>();
-
-    // Создаём сокет
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        std::cerr << "❌ Не удалось создать сокет: " << strerror(errno) << std::endl;
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    // Настраиваем адрес сервера
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-
-    if (inet_pton(AF_INET, SERVER_IP.c_str(), &server_addr.sin_addr) <= 0) {
-        std::cerr << "❌ Неверный IP-адрес: " << SERVER_IP << std::endl;
-        close(sockfd);
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    // Подключаемся
-    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "❌ Не удалось подключиться: " << strerror(errno) << std::endl;
-        close(sockfd);
-        rclcpp::shutdown();
-        return 1;
-    }
-
-    // Устанавливаем неблокирующий режим
-    int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags != -1) {
-        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    std::cout << "✅ Подключено к серверу!" << std::endl;
-    std::cout << "💡 Нажмите Ctrl+C для выхода\n" << std::endl;
-
-    // Запускаем поток чтения от сервера
-    std::thread read_thread(server_read_thread, node);
-
-    // Запускаем ROS 2 спин
     rclcpp::spin(node);
-
-    running = false;
-
-    if (read_thread.joinable()) {
-        read_thread.join();
-    }
-
-    if (sockfd != -1) {
-        close(sockfd);
-        std::cout << "\n🔌 Отключено от сервера" << std::endl;
-    }
-
     rclcpp::shutdown();
-    std::cout << "👋 Клиент завершил работу" << std::endl;
-
     return 0;
 }
