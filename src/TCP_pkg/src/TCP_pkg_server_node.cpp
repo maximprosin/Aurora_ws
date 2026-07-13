@@ -51,9 +51,9 @@ int getch_nonblock() {
     return ch;
 }
 
-class TcpGimbalServer : public rclcpp::Node {
+class TcpServerNode : public rclcpp::Node {
 public:
-    TcpGimbalServer() : Node("tcp_gimbal_server"), server_fd_(-1), running_(true) {
+    TcpServerNode() : Node("tcp_server_node"), server_fd_(-1), running_(true) {
         // ============================================
         // 1. ПАРАМЕТРЫ
         // ============================================
@@ -82,22 +82,22 @@ public:
         // ============================================
         gimbal_sub_ = this->create_subscription<mavros_msgs::msg::GimbalManagerSetPitchyaw>(
             gimbal_topic_, 10,
-            std::bind(&TcpGimbalServer::gimbal_callback, this, std::placeholders::_1));
+            std::bind(&TcpServerNode::gimbal_callback, this, std::placeholders::_1));
         RCLCPP_INFO(this->get_logger(), "📋 Подписка на камеру: %s", gimbal_topic_.c_str());
 
         teleop_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             teleop_topic_, 10,
-            std::bind(&TcpGimbalServer::teleop_callback, this, std::placeholders::_1));
+            std::bind(&TcpServerNode::teleop_callback, this, std::placeholders::_1));
         RCLCPP_INFO(this->get_logger(), "📋 Подписка на тележку: %s", teleop_topic_.c_str());
 
         key_sub_ = this->create_subscription<std_msgs::msg::String>(
             key_topic_, 10,
-            std::bind(&TcpGimbalServer::key_callback, this, std::placeholders::_1));
+            std::bind(&TcpServerNode::key_callback, this, std::placeholders::_1));
         RCLCPP_INFO(this->get_logger(), "📋 Подписка на клавиши: %s", key_topic_.c_str());
 
         keyboard_commands_sub_ = this->create_subscription<std_msgs::msg::String>(
             keyboard_commands_topic_, 10,
-            std::bind(&TcpGimbalServer::keyboard_commands_callback, this, std::placeholders::_1));
+            std::bind(&TcpServerNode::keyboard_commands_callback, this, std::placeholders::_1));
         RCLCPP_INFO(this->get_logger(), "📋 Подписка на команды клавиатуры: %s", keyboard_commands_topic_.c_str());
 
         // ============================================
@@ -131,15 +131,15 @@ public:
         // ============================================
         // 6. ЗАПУСК ПОТОКОВ
         // ============================================
-        read_thread_ = std::thread(&TcpGimbalServer::read_from_clients, this);
-        keyboard_thread_ = std::thread(&TcpGimbalServer::read_keyboard, this);  // НОВЫЙ ПОТОК ДЛЯ КЛАВИАТУРЫ
+        read_thread_ = std::thread(&TcpServerNode::read_from_clients, this);
+        keyboard_thread_ = std::thread(&TcpServerNode::read_keyboard, this);  // НОВЫЙ ПОТОК ДЛЯ КЛАВИАТУРЫ
 
         // ============================================
         // 7. ТАЙМЕР ДЛЯ СТАТИСТИКИ
         // ============================================
         stats_timer_ = this->create_wall_timer(
             std::chrono::seconds(30),
-            std::bind(&TcpGimbalServer::print_stats, this));
+            std::bind(&TcpServerNode::print_stats, this));
 
         RCLCPP_INFO(this->get_logger(), "========================================");
         RCLCPP_INFO(this->get_logger(), "🌐 TCP-сервер запущен на %s:%d", server_ip_.c_str(), server_port_);
@@ -147,7 +147,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "========================================");
     }
 
-    ~TcpGimbalServer() {
+    ~TcpServerNode() {
         running_ = false;
 
         if (read_thread_.joinable()) {
@@ -405,7 +405,7 @@ private:
             RCLCPP_WARN(this->get_logger(), "Не удалось установить неблокирующий режим");
         }
 
-        accept_thread_ = std::thread(&TcpGimbalServer::accept_clients, this);
+        accept_thread_ = std::thread(&TcpServerNode::accept_clients, this);
         return true;
     }
 
@@ -700,7 +700,7 @@ private:
 
 int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<TcpGimbalServer>();
+    auto node = std::make_shared<TcpServerNode>();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

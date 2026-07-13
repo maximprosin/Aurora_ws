@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(TCP_pkg)
+project(tcp_pkg)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -16,7 +16,7 @@ find_package(std_msgs REQUIRED)  # <-- ДОБАВИТЬ!
 # ============================================
 # TCP-КЛИЕНТ
 # ============================================
-add_executable(tcp_client_node src/TCP_pkg_client_pkg_node.cpp)
+add_executable(tcp_client_node src/TCP_pkg_client_node.cpp)
 ament_target_dependencies(tcp_client_node
     rclcpp
     std_msgs  # <-- ДОБАВИТЬ!
@@ -26,7 +26,7 @@ ament_target_dependencies(tcp_client_node
 # ============================================
 # TCP-СЕРВЕР
 # ============================================
-add_executable(tcp_server_node src/TCP_pkg_server_pkg_node.cpp)
+add_executable(tcp_server_node src/TCP_pkg_server_node.cpp)
 ament_target_dependencies(tcp_server_node
     rclcpp
     mavros_msgs
