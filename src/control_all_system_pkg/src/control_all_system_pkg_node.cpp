@@ -15,6 +15,9 @@
 #include <thread>
 #include <algorithm>
 #include <atomic>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -47,7 +50,8 @@ public:
     UnifiedController() : Node("unified_controller"), running_(true) {
         // Параметры тележки
         this->declare_parameter<int>("manual_speed_step", 50);
-        this->declare_parameter<int>("cruise_speed_pwm", 1580);
+        this->declare_parameter<int>("cruise_speed_pwm", 1900);
+        this->declare_parameter<int>("cruise_speed_pwm_backward", 1100); // НОВЫЙ ПАРАМЕТР
         this->declare_parameter<int>("steering_left_pwm", 1350);
         this->declare_parameter<int>("steering_right_pwm", 1650);
         this->declare_parameter<int>("neutral_pwm", 1500);
@@ -55,6 +59,7 @@ public:
 
         manual_speed_step_ = this->get_parameter("manual_speed_step").as_int();
         cruise_speed_pwm_ = this->get_parameter("cruise_speed_pwm").as_int();
+        cruise_speed_pwm_backward_ = this->get_parameter("cruise_speed_pwm_backward").as_int();
         steering_left_pwm_ = this->get_parameter("steering_left_pwm").as_int();
         steering_right_pwm_ = this->get_parameter("steering_right_pwm").as_int();
         neutral_pwm_ = this->get_parameter("neutral_pwm").as_int();
@@ -101,6 +106,7 @@ public:
         linear_throttle_ = neutral_pwm_;
         angular_steering_ = neutral_pwm_;
         cruise_control_active_ = false;
+        cruise_control_backward_ = false;
         last_throttle_press_time_ = this->now();
         last_steering_press_time_ = this->now();
 
@@ -126,9 +132,12 @@ public:
         command_client_ = this->create_client<mavros_msgs::srv::CommandLong>("/mavros/cmd/command");
         gimbal_client_ = this->create_client<mavros_msgs::srv::GimbalManagerPitchyaw>(gimbal_service_);
 
+        // Запускаем поток для чтения клавиш
+        keyboard_thread_ = std::thread(&UnifiedController::keyboardReader, this);
+
         // Таймеры
         telega_timer_ = this->create_wall_timer(50ms, std::bind(&UnifiedController::telegaControlLoop, this));
-        keyboard_timer_ = this->create_wall_timer(20ms, std::bind(&UnifiedController::readKeyboard, this));
+        process_queue_timer_ = this->create_wall_timer(10ms, std::bind(&UnifiedController::processKeyQueue, this));
 
         RCLCPP_INFO(this->get_logger(), "========================================");
         RCLCPP_INFO(this->get_logger(), "ОБЪЕДИНЕННЫЙ КОНТРОЛЛЕР ЗАПУЩЕН");
@@ -140,13 +149,18 @@ public:
 
     ~UnifiedController() {
         running_ = false;
+        queue_cv_.notify_all();
+        if (keyboard_thread_.joinable()) {
+            keyboard_thread_.join();
+        }
     }
 
 private:
     void printHelp() {
         std::cout << "\n=== УПРАВЛЕНИЕ ===" << std::endl;
         std::cout << "🚜 Тележка: W/S - вперед/назад, A/D - влево/вправо" << std::endl;
-        std::cout << "   Q - круиз, R/F - скорость, SPACE - стоп" << std::endl;
+        std::cout << "   Q - круиз вперед, E - круиз назад, R/F - скорость" << std::endl;
+        std::cout << "   SPACE - стоп" << std::endl;
         std::cout << "📷 Камера: СТРЕЛКИ - наклон/поворот" << std::endl;
         std::cout << "   Z/X/C - зум +/-/стоп, 1/2 - видеопоток" << std::endl;
         std::cout << "⚙️ +/- - шаг угла, H - справка, ESC - выход\n" << std::endl;
@@ -155,6 +169,8 @@ private:
     void printTelegaStatus() {
         std::cout << "\r[Тележка] ШИМ: вперед=" << (neutral_pwm_ + manual_speed_step_)
                   << " назад=" << (neutral_pwm_ - manual_speed_step_)
+                  << " | круиз F=" << cruise_speed_pwm_
+                  << " B=" << cruise_speed_pwm_backward_
                   << " | руль: лево=" << steering_left_pwm_
                   << " право=" << steering_right_pwm_ << "        " << std::flush;
     }
@@ -171,25 +187,61 @@ private:
         std::string cmd = msg->data;
         RCLCPP_INFO(this->get_logger(), "🚜 TCP: '%s'", cmd.c_str());
 
-        if (cruise_control_active_ && (cmd == "w" || cmd == "s")) {
+        if ((cruise_control_active_ || cruise_control_backward_) && (cmd == "w" || cmd == "s")) {
             cruise_control_active_ = false;
+            cruise_control_backward_ = false;
             std::cout << "\n[Круиз] Отключен через TCP." << std::endl;
         }
 
-        if (cmd == "r") { manual_speed_step_ = std::min(450, manual_speed_step_ + 25); printTelegaStatus(); }
-        else if (cmd == "f") { manual_speed_step_ = std::max(25, manual_speed_step_ - 25); printTelegaStatus(); }
-        else if (cmd == "w") { linear_throttle_ = neutral_pwm_ + manual_speed_step_; last_throttle_press_time_ = this->now(); }
-        else if (cmd == "s") { linear_throttle_ = neutral_pwm_ - manual_speed_step_; last_throttle_press_time_ = this->now(); }
+        if (cmd == "r") {
+            manual_speed_step_ = std::min(450, manual_speed_step_ + 25);
+            // Меняем скорость круиза
+            cruise_speed_pwm_ = std::min(2000, cruise_speed_pwm_ + 25);
+            cruise_speed_pwm_backward_ = std::max(1000, cruise_speed_pwm_backward_ - 25);
+            printTelegaStatus();
+        }
+        else if (cmd == "f") {
+            manual_speed_step_ = std::max(25, manual_speed_step_ - 25);
+            // Меняем скорость круиза
+            cruise_speed_pwm_ = std::max(1100, cruise_speed_pwm_ - 25);
+            cruise_speed_pwm_backward_ = std::min(1900, cruise_speed_pwm_backward_ + 25);
+            printTelegaStatus();
+        }
+        else if (cmd == "w") {
+            if (cruise_control_active_ || cruise_control_backward_) {
+                cruise_control_active_ = false;
+                cruise_control_backward_ = false;
+            }
+            linear_throttle_ = neutral_pwm_ + manual_speed_step_;
+            last_throttle_press_time_ = this->now();
+        }
+        else if (cmd == "s") {
+            if (cruise_control_active_ || cruise_control_backward_) {
+                cruise_control_active_ = false;
+                cruise_control_backward_ = false;
+            }
+            linear_throttle_ = neutral_pwm_ - manual_speed_step_;
+            last_throttle_press_time_ = this->now();
+        }
         else if (cmd == "a") { angular_steering_ = steering_left_pwm_; last_steering_press_time_ = this->now(); }
         else if (cmd == "d") { angular_steering_ = steering_right_pwm_; last_steering_press_time_ = this->now(); }
         else if (cmd == "q") {
             cruise_control_active_ = !cruise_control_active_;
+            cruise_control_backward_ = false;
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
-            std::cout << "\n[Круиз] " << (cruise_control_active_ ? "ВКЛ" : "ВЫКЛ") << std::endl;
+            std::cout << "\n[Круиз] " << (cruise_control_active_ ? "ВПЕРЕД ВКЛ" : "ВЫКЛ") << std::endl;
+        }
+        else if (cmd == "e") {
+            cruise_control_backward_ = !cruise_control_backward_;
+            cruise_control_active_ = false;
+            linear_throttle_ = neutral_pwm_;
+            angular_steering_ = neutral_pwm_;
+            std::cout << "\n[Круиз] " << (cruise_control_backward_ ? "НАЗАД ВКЛ" : "ВЫКЛ") << std::endl;
         }
         else if (cmd == " " || cmd == "stop") {
             cruise_control_active_ = false;
+            cruise_control_backward_ = false;
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
             std::cout << "\r[TCP] СТОП     " << std::flush;
@@ -220,61 +272,154 @@ private:
         }
     }
 
-    void readKeyboard() {
-        int key = getch_nonblock();
-        if (key == -1) return;
-
-        if (key == 27) {
-            int next = getch_nonblock();
-            if (next == 91) {
-                int arrow = getch_nonblock();
-                float new_pitch = static_cast<float>(pitch_);
-                float new_yaw = static_cast<float>(yaw_);
-
-                switch (arrow) {
-                case 65: new_pitch = std::min(static_cast<float>(pitch_ + step_), static_cast<float>(max_pitch_)); break;
-                case 66: new_pitch = std::max(static_cast<float>(pitch_ - step_), static_cast<float>(min_pitch_)); break;
-                case 68: new_yaw = std::min(static_cast<float>(yaw_ + step_), static_cast<float>(max_yaw_)); break;
-                case 67: new_yaw = std::max(static_cast<float>(yaw_ - step_), static_cast<float>(min_yaw_)); break;
-                default: return;
+    // ПОТОК ДЛЯ ЧТЕНИЯ КЛАВИШ
+    void keyboardReader() {
+        while (running_) {
+            int key = getch_nonblock();
+            if (key != -1) {
+                // Специальная обработка для стрелок и ESC
+                if (key == 27) { // ESC
+                    int next = getch_nonblock();
+                    if (next == 91) { // [
+                        int arrow = getch_nonblock();
+                        if (arrow != -1) {
+                            // Кодируем стрелку как отрицательное значение
+                            int arrow_code = -(arrow + 100); // -165, -166, -167, -168
+                            std::lock_guard<std::mutex> lock(queue_mutex_);
+                            key_queue_.push(arrow_code);
+                            queue_cv_.notify_one();
+                        }
+                    } else {
+                        // Простой ESC
+                        std::lock_guard<std::mutex> lock(queue_mutex_);
+                        key_queue_.push(27);
+                        queue_cv_.notify_one();
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+                    key_queue_.push(key);
+                    queue_cv_.notify_one();
                 }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
 
-                pitch_ = new_pitch;
-                yaw_ = new_yaw;
-                sendGimbalCommand(new_pitch, new_yaw);
-                return;
-            }
-            else if (next == -1) {
-                RCLCPP_INFO(this->get_logger(), "⏹️ Выход...");
-                running_ = false;
-                rclcpp::shutdown();
-                return;
-            }
+    // ОБРАБОТКА ОЧЕРЕДИ КЛАВИШ
+    void processKeyQueue() {
+        std::queue<int> local_queue;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (key_queue_.empty()) return;
+            std::swap(key_queue_, local_queue);
         }
 
+        while (!local_queue.empty()) {
+            int key = local_queue.front();
+            local_queue.pop();
+            processKey(key);
+        }
+    }
+
+    // ОБРАБОТКА ОТДЕЛЬНОЙ КЛАВИШИ
+    void processKey(int key) {
+        // Обработка стрелок (отрицательные коды)
+        if (key < 0) {
+            int arrow = -(key + 100); // Восстанавливаем код стрелки
+            float new_pitch = static_cast<float>(pitch_);
+            float new_yaw = static_cast<float>(yaw_);
+
+            switch (arrow) {
+            case 65: // Вверх
+                new_pitch = std::min(static_cast<float>(pitch_ + step_), static_cast<float>(max_pitch_));
+                break;
+            case 66: // Вниз
+                new_pitch = std::max(static_cast<float>(pitch_ - step_), static_cast<float>(min_pitch_));
+                break;
+            case 67: // Вправо
+                new_yaw = std::max(static_cast<float>(yaw_ - step_), static_cast<float>(min_yaw_));
+                break;
+            case 68: // Влево
+                new_yaw = std::min(static_cast<float>(yaw_ + step_), static_cast<float>(max_yaw_));
+                break;
+            default:
+                return;
+            }
+
+            pitch_ = new_pitch;
+            yaw_ = new_yaw;
+            sendGimbalCommand(new_pitch, new_yaw);
+            return;
+        }
+
+        // Обработка обычных клавиш
         switch (key) {
+        // Тележка
         case 'w': case 'W':
-            if (cruise_control_active_) { cruise_control_active_ = false; std::cout << "\n[Круиз] Отключен." << std::endl; }
+            if (cruise_control_active_ || cruise_control_backward_) {
+                cruise_control_active_ = false;
+                cruise_control_backward_ = false;
+                std::cout << "\n[Круиз] Отключен." << std::endl;
+            }
             linear_throttle_ = neutral_pwm_ + manual_speed_step_;
             last_throttle_press_time_ = this->now();
             break;
+
         case 's': case 'S':
-            if (cruise_control_active_) { cruise_control_active_ = false; std::cout << "\n[Круиз] Отключен." << std::endl; }
+            if (cruise_control_active_ || cruise_control_backward_) {
+                cruise_control_active_ = false;
+                cruise_control_backward_ = false;
+                std::cout << "\n[Круиз] Отключен." << std::endl;
+            }
             linear_throttle_ = neutral_pwm_ - manual_speed_step_;
             last_throttle_press_time_ = this->now();
             break;
-        case 'a': case 'A': angular_steering_ = steering_left_pwm_; last_steering_press_time_ = this->now(); break;
-        case 'd': case 'D': angular_steering_ = steering_right_pwm_; last_steering_press_time_ = this->now(); break;
+
+        case 'a': case 'A':
+            angular_steering_ = steering_left_pwm_;
+            last_steering_press_time_ = this->now();
+            break;
+
+        case 'd': case 'D':
+            angular_steering_ = steering_right_pwm_;
+            last_steering_press_time_ = this->now();
+            break;
+
         case 'q': case 'Q':
             cruise_control_active_ = !cruise_control_active_;
+            cruise_control_backward_ = false;
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
-            std::cout << "\n🚜 Круиз: " << (cruise_control_active_ ? "ВКЛ" : "ВЫКЛ") << std::endl;
+            std::cout << "\n🚜 Круиз ВПЕРЕД: " << (cruise_control_active_ ? "ВКЛ" : "ВЫКЛ") << std::endl;
             break;
-        case 'r': case 'R': manual_speed_step_ = std::min(450, manual_speed_step_ + 25); printTelegaStatus(); break;
-        case 'f': case 'F': manual_speed_step_ = std::max(25, manual_speed_step_ - 25); printTelegaStatus(); break;
+
+        case 'e': case 'E':
+            cruise_control_backward_ = !cruise_control_backward_;
+            cruise_control_active_ = false;
+            linear_throttle_ = neutral_pwm_;
+            angular_steering_ = neutral_pwm_;
+            std::cout << "\n🚜 Круиз НАЗАД: " << (cruise_control_backward_ ? "ВКЛ" : "ВЫКЛ") << std::endl;
+            break;
+
+        case 'r': case 'R':
+            manual_speed_step_ = std::min(450, manual_speed_step_ + 25);
+            // Меняем скорость круиза
+            cruise_speed_pwm_ = std::min(2000, cruise_speed_pwm_ + 25);
+            cruise_speed_pwm_backward_ = std::max(1000, cruise_speed_pwm_backward_ - 25);
+            printTelegaStatus();
+            break;
+
+        case 'f': case 'F':
+            manual_speed_step_ = std::max(25, manual_speed_step_ - 25);
+            // Меняем скорость круиза
+            cruise_speed_pwm_ = std::max(1100, cruise_speed_pwm_ - 25);
+            cruise_speed_pwm_backward_ = std::min(1900, cruise_speed_pwm_backward_ + 25);
+            printTelegaStatus();
+            break;
+
         case ' ':
             cruise_control_active_ = false;
+            cruise_control_backward_ = false;
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
             pitch_ = 0.0f;
@@ -282,14 +427,48 @@ private:
             sendGimbalCommand(0.0f, 0.0f);
             std::cout << "\r🛑 ПОЛНЫЙ СТОП     " << std::flush;
             break;
-        case 'z': case 'Z': sendZoomContinuous(zoom_speed_); break;
-        case 'x': case 'X': sendZoomContinuous(-zoom_speed_); break;
-        case 'c': case 'C': sendZoomStop(); break;
-        case '1': setImageMode(vdisp_rgb_, "RGB ЗУМ"); break;
-        case '2': setImageMode(vdisp_wide_thermal_, "WIDE/THERMAL"); break;
-        case '+': case '=': if (step_ < 20.0) step_ += 0.5; break;
-        case '-': case '_': if (step_ > 0.5) step_ -= 0.5; break;
-        case 'h': case 'H': printHelp(); break;
+
+            // Камера
+        case 'z': case 'Z':
+            sendZoomContinuous(zoom_speed_);
+            break;
+
+        case 'x': case 'X':
+            sendZoomContinuous(-zoom_speed_);
+            break;
+
+        case 'c': case 'C':
+            sendZoomStop();
+            break;
+
+        case '1':
+            setImageMode(vdisp_rgb_, "RGB ЗУМ");
+            break;
+
+        case '2':
+            setImageMode(vdisp_wide_thermal_, "WIDE/THERMAL");
+            break;
+
+            // Настройки
+        case '+': case '=':
+            if (step_ < 20.0) step_ += 0.5;
+            std::cout << "\r📐 Шаг угла: " << step_ << "°     " << std::flush;
+            break;
+
+        case '-': case '_':
+            if (step_ > 0.5) step_ -= 0.5;
+            std::cout << "\r📐 Шаг угла: " << step_ << "°     " << std::flush;
+            break;
+
+        case 'h': case 'H':
+            printHelp();
+            break;
+
+        case 27: // ESC
+            RCLCPP_INFO(this->get_logger(), "⏹️ Выход...");
+            running_ = false;
+            rclcpp::shutdown();
+            break;
         }
     }
 
@@ -303,7 +482,7 @@ private:
             angular_steering_ = neutral_pwm_;
         }
 
-        if (!cruise_control_active_) {
+        if (!cruise_control_active_ && !cruise_control_backward_) {
             auto elapsed_throttle = current_time - last_throttle_press_time_;
             if (elapsed_throttle.nanoseconds() > 200000000) {
                 linear_throttle_ = neutral_pwm_;
@@ -314,7 +493,15 @@ private:
         int pwm_motor2 = neutral_pwm_;
 
         if (is_armed_) {
-            int current_linear = cruise_control_active_ ? cruise_speed_pwm_ : linear_throttle_;
+            int current_linear;
+            if (cruise_control_active_) {
+                current_linear = cruise_speed_pwm_;
+            } else if (cruise_control_backward_) {
+                current_linear = cruise_speed_pwm_backward_;
+            } else {
+                current_linear = linear_throttle_;
+            }
+
             int steering_offset = angular_steering_ - neutral_pwm_;
 
             pwm_motor1 = std::clamp(current_linear + steering_offset, 1000, 2000);
@@ -323,6 +510,7 @@ private:
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
             cruise_control_active_ = false;
+            cruise_control_backward_ = false;
         }
 
         sendServoCommand(1, pwm_motor1);
@@ -422,9 +610,10 @@ private:
     // Переменные тележки
     bool is_connected_, is_armed_;
     int linear_throttle_, angular_steering_;
-    int manual_speed_step_, cruise_speed_pwm_;
+    int manual_speed_step_, cruise_speed_pwm_, cruise_speed_pwm_backward_;
     int steering_left_pwm_, steering_right_pwm_, neutral_pwm_;
     bool cruise_control_active_;
+    bool cruise_control_backward_; // НОВАЯ ПЕРЕМЕННАЯ
     rclcpp::Time last_throttle_press_time_, last_steering_press_time_;
     std::string telega_cmd_topic_;
 
@@ -453,8 +642,13 @@ private:
 
     // Таймеры
     rclcpp::TimerBase::SharedPtr telega_timer_;
-    rclcpp::TimerBase::SharedPtr keyboard_timer_;
+    rclcpp::TimerBase::SharedPtr process_queue_timer_;
 
+    // Очередь событий
+    std::queue<int> key_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread keyboard_thread_;
     std::atomic<bool> running_;
 };
 
