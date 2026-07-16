@@ -47,7 +47,7 @@ public:
         if (!build_and_start_pipeline(rtsp_urls_[0])) {
             RCLCPP_ERROR(this->get_logger(), "Failed to start initial pipeline");
         } else {
-            current_stream_id_ = 0;
+            current_stream_id_ = 1;
         }
 
         RCLCPP_INFO(this->get_logger(), "VideoCamera Node ready!");
