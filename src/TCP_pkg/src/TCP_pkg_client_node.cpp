@@ -198,35 +198,58 @@ private:
 
         auto msg = std_msgs::msg::String();
 
+        // Обработка команд в формате KEY:название:действие
         if (line.find("KEY:") == 0) {
             std::string key_info = line.substr(4);
+
+            // Расширенный маппинг клавиш
             std::map<std::string, std::string> key_mapping = {
-                {"W:press", "w"}, {"S:press", "s"}, {"A:press", "a"}, {"D:press", "d"},
-                {"Q:press", "q"}, {"R:press", "r"}, {"F:press", "f"}, {"SPACE:press", " "},
-                {"UP:press", "UP"}, {"DOWN:press", "DOWN"}, {"LEFT:press", "LEFT"}, {"RIGHT:press", "RIGHT"},
+                // Тележка
+                {"W:press", "w"}, {"S:press", "s"},
+                {"A:press", "a"}, {"D:press", "d"},
+                {"Q:press", "q"}, {"E:press", "e"},  // ДОБАВЛЕНА КЛАВИША E
+                {"R:press", "r"}, {"F:press", "f"},
+                {"SPACE:press", " "},
+
+                // Камера - стрелки
+                {"UP:press", "UP"}, {"DOWN:press", "DOWN"},
+                {"LEFT:press", "LEFT"}, {"RIGHT:press", "RIGHT"},
+
+                // Камера - зум и режимы
                 {"PLUS:press", "PLUS"}, {"MINUS:press", "MINUS"},
-                {"Z:press", "Z"}, {"X:press", "X"}, {"C:press", "C"}
+                {"Z:press", "Z"}, {"X:press", "X"}, {"C:press", "C"},
+
+                // Переключение видеопотока (ДОБАВЛЕНЫ)
+                {"1:press", "1"}, {"2:press", "2"}
             };
+
             auto it = key_mapping.find(key_info);
             if (it != key_mapping.end()) {
                 std::string command = it->second;
                 msg.data = command;
+
+                // Определяем, куда отправлять команду
                 if (command == "UP" || command == "DOWN" || command == "LEFT" || command == "RIGHT" ||
-                    command == "PLUS" || command == "MINUS" || command == "Z" || command == "X" || command == "C") {
+                    command == "PLUS" || command == "MINUS" || command == "Z" || command == "X" || command == "C" ||
+                    command == "1" || command == "2") {  // ДОБАВЛЕНЫ 1 и 2
                     camera_cmd_pub_->publish(msg);
                     RCLCPP_INFO(this->get_logger(), "📷 Команда камере: '%s'", command.c_str());
                 } else {
                     telega_cmd_pub_->publish(msg);
                     RCLCPP_INFO(this->get_logger(), "🚜 Команда тележке: '%s'", command.c_str());
                 }
+            } else {
+                RCLCPP_DEBUG(this->get_logger(), "Неизвестная клавиша: %s", key_info.c_str());
             }
         }
+        // Прямые команды для тележки
         else if (line.find("TELEGA:") == 0) {
             std::string cmd = line.substr(7);
             msg.data = cmd;
             telega_cmd_pub_->publish(msg);
             RCLCPP_INFO(this->get_logger(), "🚜 TCP TELEGA: '%s'", cmd.c_str());
         }
+        // Прямые команды для камеры
         else if (line.find("CAMERA:") == 0) {
             std::string cmd = line.substr(7);
             msg.data = cmd;
