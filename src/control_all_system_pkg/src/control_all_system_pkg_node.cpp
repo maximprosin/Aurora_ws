@@ -50,12 +50,16 @@ public:
     UnifiedController() : Node("unified_controller"), running_(true) {
         // Параметры тележки
         this->declare_parameter<int>("manual_speed_step", 50);
-        this->declare_parameter<int>("cruise_speed_pwm", 1900);
-        this->declare_parameter<int>("cruise_speed_pwm_backward", 1100); // НОВЫЙ ПАРАМЕТР
+        this->declare_parameter<int>("cruise_speed_pwm", 1500);
+        this->declare_parameter<int>("cruise_speed_pwm_backward", 1100);
         this->declare_parameter<int>("steering_left_pwm", 1350);
         this->declare_parameter<int>("steering_right_pwm", 1650);
         this->declare_parameter<int>("neutral_pwm", 1500);
         this->declare_parameter<std::string>("telega_cmd_topic", "/telega_commands");
+
+        // НОВЫЕ ПАРАМЕТРЫ ДЛЯ TCP
+        this->declare_parameter<int>("tcp_timeout_ms", 800);
+        this->declare_parameter<int>("keyboard_timeout_ms", 200);
 
         manual_speed_step_ = this->get_parameter("manual_speed_step").as_int();
         cruise_speed_pwm_ = this->get_parameter("cruise_speed_pwm").as_int();
@@ -64,6 +68,10 @@ public:
         steering_right_pwm_ = this->get_parameter("steering_right_pwm").as_int();
         neutral_pwm_ = this->get_parameter("neutral_pwm").as_int();
         telega_cmd_topic_ = this->get_parameter("telega_cmd_topic").as_string();
+
+        // Загружаем новые параметры
+        tcp_timeout_ms_ = this->get_parameter("tcp_timeout_ms").as_int();
+        keyboard_timeout_ms_ = this->get_parameter("keyboard_timeout_ms").as_int();
 
         // Параметры камеры
         this->declare_parameter<std::string>("gimbal_topic", "/gimbal/commands");
@@ -110,6 +118,10 @@ public:
         last_throttle_press_time_ = this->now();
         last_steering_press_time_ = this->now();
 
+        // НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ TCP
+        is_tcp_mode_ = false;
+        last_tcp_command_time_ = this->now();
+
         // Подписчики
         state_sub_ = this->create_subscription<mavros_msgs::msg::State>(
             "/mavros/state", 10,
@@ -143,6 +155,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "ОБЪЕДИНЕННЫЙ КОНТРОЛЛЕР ЗАПУЩЕН");
         RCLCPP_INFO(this->get_logger(), "🚜 Тележка: %s", telega_cmd_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "📷 Камера: %s", camera_cmd_topic_.c_str());
+        RCLCPP_INFO(this->get_logger(), "⚙️ TCP таймаут: %d мс, клавиатура: %d мс", tcp_timeout_ms_, keyboard_timeout_ms_);
         RCLCPP_INFO(this->get_logger(), "========================================");
         printHelp();
     }
@@ -156,6 +169,16 @@ public:
     }
 
 private:
+    // ВСПОМОГАТЕЛЬНЫЙ МЕТОД ДЛЯ ПОЛУЧЕНИЯ ТЕКУЩЕЙ СКОРОСТИ КРУИЗА
+    int getCruiseSpeed() {
+        // Используем те же значения, что и в ручном режиме
+        return neutral_pwm_ + manual_speed_step_;
+    }
+
+    int getCruiseSpeedBackward() {
+        return neutral_pwm_ - manual_speed_step_;
+    }
+
     void printHelp() {
         std::cout << "\n=== УПРАВЛЕНИЕ ===" << std::endl;
         std::cout << "🚜 Тележка: W/S - вперед/назад, A/D - влево/вправо" << std::endl;
@@ -169,10 +192,12 @@ private:
     void printTelegaStatus() {
         std::cout << "\r[Тележка] ШИМ: вперед=" << (neutral_pwm_ + manual_speed_step_)
                   << " назад=" << (neutral_pwm_ - manual_speed_step_)
-                  << " | круиз F=" << cruise_speed_pwm_
-                  << " B=" << cruise_speed_pwm_backward_
+                  << " | круиз F=" << getCruiseSpeed()
+                  << " B=" << getCruiseSpeedBackward()
                   << " | руль: лево=" << steering_left_pwm_
-                  << " право=" << steering_right_pwm_ << "        " << std::flush;
+                  << " право=" << steering_right_pwm_
+                  << (is_tcp_mode_ ? " [TCP]" : " [KB]")
+                  << "        " << std::flush;
     }
 
     void stateCallback(const mavros_msgs::msg::State::SharedPtr msg) {
@@ -183,9 +208,14 @@ private:
         }
     }
 
+    // ИЗМЕНЕННЫЙ ОБРАБОТЧИК TCP КОМАНД
     void telegaCmdCallback(const std_msgs::msg::String::SharedPtr msg) {
         std::string cmd = msg->data;
         RCLCPP_INFO(this->get_logger(), "🚜 TCP: '%s'", cmd.c_str());
+
+        // ВКЛЮЧАЕМ TCP РЕЖИМ
+        is_tcp_mode_ = true;
+        last_tcp_command_time_ = this->now();
 
         if ((cruise_control_active_ || cruise_control_backward_) && (cmd == "w" || cmd == "s")) {
             cruise_control_active_ = false;
@@ -195,16 +225,10 @@ private:
 
         if (cmd == "r") {
             manual_speed_step_ = std::min(450, manual_speed_step_ + 25);
-            // Меняем скорость круиза
-            cruise_speed_pwm_ = std::min(2000, cruise_speed_pwm_ + 25);
-            cruise_speed_pwm_backward_ = std::max(1000, cruise_speed_pwm_backward_ - 25);
             printTelegaStatus();
         }
         else if (cmd == "f") {
             manual_speed_step_ = std::max(25, manual_speed_step_ - 25);
-            // Меняем скорость круиза
-            cruise_speed_pwm_ = std::max(1100, cruise_speed_pwm_ - 25);
-            cruise_speed_pwm_backward_ = std::min(1900, cruise_speed_pwm_backward_ + 25);
             printTelegaStatus();
         }
         else if (cmd == "w") {
@@ -223,8 +247,14 @@ private:
             linear_throttle_ = neutral_pwm_ - manual_speed_step_;
             last_throttle_press_time_ = this->now();
         }
-        else if (cmd == "a") { angular_steering_ = steering_left_pwm_; last_steering_press_time_ = this->now(); }
-        else if (cmd == "d") { angular_steering_ = steering_right_pwm_; last_steering_press_time_ = this->now(); }
+        else if (cmd == "a") {
+            angular_steering_ = steering_left_pwm_;
+            last_steering_press_time_ = this->now();
+        }
+        else if (cmd == "d") {
+            angular_steering_ = steering_right_pwm_;
+            last_steering_press_time_ = this->now();
+        }
         else if (cmd == "q") {
             cruise_control_active_ = !cruise_control_active_;
             cruise_control_backward_ = false;
@@ -244,6 +274,7 @@ private:
             cruise_control_backward_ = false;
             linear_throttle_ = neutral_pwm_;
             angular_steering_ = neutral_pwm_;
+            is_tcp_mode_ = false;
             std::cout << "\r[TCP] СТОП     " << std::flush;
         }
     }
@@ -277,20 +308,17 @@ private:
         while (running_) {
             int key = getch_nonblock();
             if (key != -1) {
-                // Специальная обработка для стрелок и ESC
-                if (key == 27) { // ESC
+                if (key == 27) {
                     int next = getch_nonblock();
-                    if (next == 91) { // [
+                    if (next == 91) {
                         int arrow = getch_nonblock();
                         if (arrow != -1) {
-                            // Кодируем стрелку как отрицательное значение
-                            int arrow_code = -(arrow + 100); // -165, -166, -167, -168
+                            int arrow_code = -(arrow + 100);
                             std::lock_guard<std::mutex> lock(queue_mutex_);
                             key_queue_.push(arrow_code);
                             queue_cv_.notify_one();
                         }
                     } else {
-                        // Простой ESC
                         std::lock_guard<std::mutex> lock(queue_mutex_);
                         key_queue_.push(27);
                         queue_cv_.notify_one();
@@ -305,7 +333,6 @@ private:
         }
     }
 
-    // ОБРАБОТКА ОЧЕРЕДИ КЛАВИШ
     void processKeyQueue() {
         std::queue<int> local_queue;
         {
@@ -321,25 +348,32 @@ private:
         }
     }
 
-    // ОБРАБОТКА ОТДЕЛЬНОЙ КЛАВИШИ
     void processKey(int key) {
-        // Обработка стрелок (отрицательные коды)
+        if (is_tcp_mode_ && key != 27 && key != 'h' && key != 'H') {
+            return;
+        }
+
+        if (is_tcp_mode_) {
+            is_tcp_mode_ = false;
+            std::cout << "\n[Управление] Переключено на клавиатуру" << std::flush;
+        }
+
         if (key < 0) {
-            int arrow = -(key + 100); // Восстанавливаем код стрелки
+            int arrow = -(key + 100);
             float new_pitch = static_cast<float>(pitch_);
             float new_yaw = static_cast<float>(yaw_);
 
             switch (arrow) {
-            case 65: // Вверх
+            case 65:
                 new_pitch = std::min(static_cast<float>(pitch_ + step_), static_cast<float>(max_pitch_));
                 break;
-            case 66: // Вниз
+            case 66:
                 new_pitch = std::max(static_cast<float>(pitch_ - step_), static_cast<float>(min_pitch_));
                 break;
-            case 67: // Вправо
+            case 67:
                 new_yaw = std::max(static_cast<float>(yaw_ - step_), static_cast<float>(min_yaw_));
                 break;
-            case 68: // Влево
+            case 68:
                 new_yaw = std::min(static_cast<float>(yaw_ + step_), static_cast<float>(max_yaw_));
                 break;
             default:
@@ -352,9 +386,7 @@ private:
             return;
         }
 
-        // Обработка обычных клавиш
         switch (key) {
-        // Тележка
         case 'w': case 'W':
             if (cruise_control_active_ || cruise_control_backward_) {
                 cruise_control_active_ = false;
@@ -403,17 +435,11 @@ private:
 
         case 'r': case 'R':
             manual_speed_step_ = std::min(450, manual_speed_step_ + 25);
-            // Меняем скорость круиза
-            cruise_speed_pwm_ = std::min(2000, cruise_speed_pwm_ + 25);
-            cruise_speed_pwm_backward_ = std::max(1000, cruise_speed_pwm_backward_ - 25);
             printTelegaStatus();
             break;
 
         case 'f': case 'F':
             manual_speed_step_ = std::max(25, manual_speed_step_ - 25);
-            // Меняем скорость круиза
-            cruise_speed_pwm_ = std::max(1100, cruise_speed_pwm_ - 25);
-            cruise_speed_pwm_backward_ = std::min(1900, cruise_speed_pwm_backward_ + 25);
             printTelegaStatus();
             break;
 
@@ -425,10 +451,10 @@ private:
             pitch_ = 0.0f;
             yaw_ = 0.0f;
             sendGimbalCommand(0.0f, 0.0f);
+            is_tcp_mode_ = false;
             std::cout << "\r🛑 ПОЛНЫЙ СТОП     " << std::flush;
             break;
 
-            // Камера
         case 'z': case 'Z':
             sendZoomContinuous(zoom_speed_);
             break;
@@ -449,7 +475,6 @@ private:
             setImageMode(vdisp_wide_thermal_, "WIDE/THERMAL");
             break;
 
-            // Настройки
         case '+': case '=':
             if (step_ < 20.0) step_ += 0.5;
             std::cout << "\r📐 Шаг угла: " << step_ << "°     " << std::flush;
@@ -464,7 +489,7 @@ private:
             printHelp();
             break;
 
-        case 27: // ESC
+        case 27:
             RCLCPP_INFO(this->get_logger(), "⏹️ Выход...");
             running_ = false;
             rclcpp::shutdown();
@@ -477,15 +502,25 @@ private:
 
         auto current_time = this->now();
 
+        int timeout_ms = is_tcp_mode_ ? tcp_timeout_ms_ : keyboard_timeout_ms_;
+
         auto elapsed_steering = current_time - last_steering_press_time_;
-        if (elapsed_steering.nanoseconds() > 200000000) {
+        if (elapsed_steering.nanoseconds() > timeout_ms * 1000000LL) {
             angular_steering_ = neutral_pwm_;
         }
 
         if (!cruise_control_active_ && !cruise_control_backward_) {
             auto elapsed_throttle = current_time - last_throttle_press_time_;
-            if (elapsed_throttle.nanoseconds() > 200000000) {
+            if (elapsed_throttle.nanoseconds() > timeout_ms * 1000000LL) {
                 linear_throttle_ = neutral_pwm_;
+            }
+        }
+
+        if (is_tcp_mode_) {
+            auto elapsed_tcp = current_time - last_tcp_command_time_;
+            if (elapsed_tcp.nanoseconds() > tcp_timeout_ms_ * 1000000LL * 2) {
+                is_tcp_mode_ = false;
+                std::cout << "\n[Управление] TCP режим деактивирован (таймаут)" << std::flush;
             }
         }
 
@@ -495,9 +530,10 @@ private:
         if (is_armed_) {
             int current_linear;
             if (cruise_control_active_) {
-                current_linear = cruise_speed_pwm_;
+                // ИСПОЛЬЗУЕМ ТЕ ЖЕ ЗНАЧЕНИЯ, ЧТО И В РУЧНОМ РЕЖИМЕ
+                current_linear = getCruiseSpeed();
             } else if (cruise_control_backward_) {
-                current_linear = cruise_speed_pwm_backward_;
+                current_linear = getCruiseSpeedBackward();
             } else {
                 current_linear = linear_throttle_;
             }
@@ -511,6 +547,7 @@ private:
             angular_steering_ = neutral_pwm_;
             cruise_control_active_ = false;
             cruise_control_backward_ = false;
+            is_tcp_mode_ = false;
         }
 
         sendServoCommand(1, pwm_motor1);
@@ -613,9 +650,14 @@ private:
     int manual_speed_step_, cruise_speed_pwm_, cruise_speed_pwm_backward_;
     int steering_left_pwm_, steering_right_pwm_, neutral_pwm_;
     bool cruise_control_active_;
-    bool cruise_control_backward_; // НОВАЯ ПЕРЕМЕННАЯ
+    bool cruise_control_backward_;
     rclcpp::Time last_throttle_press_time_, last_steering_press_time_;
     std::string telega_cmd_topic_;
+
+    bool is_tcp_mode_;
+    rclcpp::Time last_tcp_command_time_;
+    int tcp_timeout_ms_;
+    int keyboard_timeout_ms_;
 
     // Переменные камеры
     double pitch_ = 0.0, yaw_ = 0.0;
